@@ -1,0 +1,8 @@
+build/
+build_guardtest/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+__pycache__/
+.DS_Store
