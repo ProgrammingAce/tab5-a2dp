@@ -616,6 +616,7 @@ static volatile uint32_t s_stream_max, s_stream_pkts, s_stream_frames, s_stream_
 #define SBC_RING_N 128
 #define SBC_FRAME_MAX 64
 static uint8_t s_sbc_ring[SBC_RING_N][SBC_FRAME_MAX];
+static uint8_t s_sbc_len[SBC_RING_N]; /* 1.4.252: per-frame length (the host adapts the bitpool mid-stream) */
 static volatile uint32_t s_sbc_w, s_sbc_r, s_sbc_drops, s_sbc_in;
 static volatile uint8_t s_sbc_flen, s_stream_src; /* source: 1 built-in beep, 2 host frames */
 
@@ -773,16 +774,21 @@ static void stream_task(void *unused)
 		const unsigned fpp = s_stream_fpp;
 		if (s_stream_src == 2) {
 			/* host frames: the P4 paces in real time; send whenever a packet's worth is buffered */
-			const unsigned flen = s_sbc_flen;
-			if (!flen || s_sbc_w - s_sbc_r < fpp) { vTaskDelay(1); continue; }
-			const unsigned body = 13u + fpp * flen, total = 4u + body, frags = (total + 26u) / 27u;
+			if (!s_sbc_flen || s_sbc_w - s_sbc_r < fpp) { vTaskDelay(1); continue; }
+			unsigned body = 13u;
+			for (unsigned f = 0; f < fpp; ++f) body += s_sbc_len[(s_sbc_r + f) % SBC_RING_N];
+			const unsigned total = 4u + body, frags = (total + 26u) / 27u;
 			if (FIFO_N - fifo_count() < frags) { ++s_stream_full; vTaskDelay(1); continue; }
 			pkt[0] = (uint8_t)body; pkt[1] = (uint8_t)(body >> 8); pkt[2] = (uint8_t)s_stream_dcid; pkt[3] = (uint8_t)(s_stream_dcid >> 8);
 			uint8_t *r = pkt + 4;
 			r[0] = 0x80; r[1] = 96; r[2] = (uint8_t)(seq >> 8); r[3] = (uint8_t)seq;
 			r[4] = (uint8_t)(ts >> 24); r[5] = (uint8_t)(ts >> 16); r[6] = (uint8_t)(ts >> 8); r[7] = (uint8_t)ts;
 			r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 1; r[12] = (uint8_t)fpp;
-			for (unsigned f = 0; f < fpp; ++f) memcpy(r + 13 + f * flen, s_sbc_ring[(s_sbc_r + f) % SBC_RING_N], flen);
+			for (unsigned f = 0, o = 13; f < fpp; ++f) {
+				const unsigned e = (s_sbc_r + f) % SBC_RING_N;
+				memcpy(r + o, s_sbc_ring[e], s_sbc_len[e]);
+				o += s_sbc_len[e];
+			}
 			s_sbc_r = s_sbc_r + fpp;
 			for (unsigned off = 0; off < total; off += 27u)
 				(void)fifo_push(BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < 27u ? total - off : 27u);
@@ -2458,6 +2464,7 @@ bool radio_lab_h2c(const uint8_t *h4, uint16_t len)
 			for (unsigned i = 0; i < nf; ++i) {
 				if (s_sbc_w - s_sbc_r >= SBC_RING_N) { ++s_sbc_drops; continue; }
 				memcpy(s_sbc_ring[s_sbc_w % SBC_RING_N], h4 + 12 + i * fl, fl);
+				s_sbc_len[s_sbc_w % SBC_RING_N] = (uint8_t)fl;
 				s_sbc_w = s_sbc_w + 1u;
 				++s_sbc_in;
 			}

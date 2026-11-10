@@ -66,7 +66,7 @@ internal tone off before feeding external PCM.
   configuration.
 - ESP-IDF **5.5.5**, target `esp32p4` for the demo.
 - Ordinary Bluetooth Classic A2DP headphones or speaker.
-- C6 running the custom **1.4.251** image in `firmware/network_adapter.bin`,
+- C6 running the custom **1.4.252** image in `firmware/network_adapter.bin`,
   installed and confirmed before launching the P4 demo. Stock Tab5 C6 firmware
   cannot run this implementation. See [C6 firmware](firmware/README.md).
 
@@ -97,7 +97,7 @@ python -m esptool --chip esp32p4 -p /dev/cu.usbmodem1101 -b 460800 \
   write_flash 0x0 tab5_a2dp_demo_merged.bin
 ```
 
-Either way the C6 needs the matching 1.4.251 image (see
+Either way the C6 needs the matching 1.4.252 image (see
 [C6 firmware](firmware/README.md)); the P4 images do not install it.
 
 ## Build and run
@@ -187,6 +187,14 @@ avoids a bad offset. `a2dp qmax <pct>` changes the threshold (-1 forces the
 retries for testing); `a2dp lateskip`, `a2dp connls44` and `a2dp rxearly` are
 radio tuning controls that apply to the next connection.
 
+A link can also drift into a bad phase minutes after it started, so the stream
+adapts continuously: each second, more than 15 % missed replies or a full C6
+frame ring lowers the SBC bitpool by two (14, 12, 10, 8); five clean seconds
+raise it again. Audio quality drops during a bad phase instead of breaking up.
+The connection receive window (`ls44` 700) ends early enough that a missed
+reply costs one radio slot instead of two. `a2dp status` shows the current
+bitpool.
+
 The convenience command `a2dp pair` discovers and pairs the first audio device
 it finds; explicit discovery and address selection are preferable around
 multiple devices. `a2dp connect beep` loops the C6's built-in SBC beep for
@@ -214,17 +222,21 @@ guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
 
-**2026-11-10, C6 1.4.247-1.4.251 update.** The radio changes (long-FHS paging,
-late-hook slot skip, FHS-anchored slot grid) and the link-quality reconnect were
+**2026-11-10, C6 1.4.247-1.4.252 update.** The radio changes (long-FHS paging,
+late-hook slot skip, FHS-anchored slot grid), the link-quality reconnect and the
+adaptive bitpool were
 developed and measured in the parent Tab5 firmware on a Galaxy Projector Speaker
 (LAP `E91187`, length byte 70): page in 0.1-3.5 s, SSP pairing, encrypted
 streaming; ten consecutive connections at 1-8 % missed replies with no dropped
 SBC frames, and three forced quality retries that reconnected cleanly. Before the
 slot-skip fix about half of all connections ran at 25-40 % missed replies with
-audible breakup. The prebuilt images in `firmware/` are the shipped C6 image that
+audible breakup, and bad phases also began mid-link. With 1.4.252 and the
+adaptive bitpool, a 5.3-minute soak that included four minutes at about 41 %
+missed replies (bitpool 8) dropped no SBC frames; the bitpool returned to 14 in
+a clean stretch. The prebuilt images in `firmware/` are the shipped C6 image that
 was installed and confirmed on that Tab5, and a clean P4 build of this demo. This
 demo's own P4 build has not yet been flashed and run on hardware, and the Bose
-headphones used for the earlier work have not been retested with 1.4.251.
+headphones used for the earlier work have not been retested with 1.4.252.
 
 **Earlier validation.**
 
@@ -241,7 +253,7 @@ bundled C6 source also built successfully in isolation; its controller hook
 checker reports `RESULT: PASS`, and the guard and CIS host tests pass.
 
 This is an experimental BR-only implementation using one-slot packets, a low SBC
-bitpool (14 for streaming; advertised maximum 20), and a fixed local identity
+bitpool (8-14 for streaming, adapted to the link; advertised maximum 20), and a fixed local identity
 chosen to fit the DTM framing constraints. Multi-slot DH3/DH5, adaptive
 frequency hopping, AVRCP absolute volume and idle AVDTP suspension are not
 implemented. Receiver compatibility and reconnect after a real range loss remain

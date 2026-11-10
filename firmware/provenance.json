@@ -1,11 +1,11 @@
 {
-  "c6_version": "1.4.251",
-  "c6_image_sha256": "2cb48960375b2f199732695ab43b35e4b2afd7d877707ce603a65d453193abc1",
-  "c6_image_origin": "parent tab5 repo main/bt/c6/network_adapter.bin, built by tools/br_lab/session224/c6_release.sh from c6_fw 70b638b + the 1.4.247-1.4.251 radio_lab.c changes included in this repo (c6_fw/c6_firmware/main/radio_lab.c is identical); installed and confirmed on hardware 2026-11-10",
-  "c6_rebuild_check": "this repo's c6_fw source rebuilt with sdkconfig.release: verify_hooks RESULT: PASS, version string 1.4.251 (image hash differs by build metadata)",
-  "p4_source": "this repository (demo), base commit ada8c2d plus the 2026-11-10 A2DP fixes; parent tab5 base 75a76e7",
+  "c6_version": "1.4.252",
+  "c6_image_sha256": "c9f14421677771f1e9724e7045bbb266b88649b1734498c81f170ea2111b6b33",
+  "c6_image_origin": "parent tab5 repo main/bt/c6/network_adapter.bin, built by tools/br_lab/session224/c6_release.sh from c6_fw 70b638b + the 1.4.247-1.4.252 radio_lab.c changes included in this repo (c6_fw/c6_firmware/main/radio_lab.c is identical); installed and confirmed on hardware 2026-11-10",
+  "c6_rebuild_check": "this repo's c6_fw source rebuilt with sdkconfig.release: verify_hooks RESULT: PASS, version string 1.4.252 (image hash differs by build metadata)",
+  "p4_source": "this repository (demo), commit 7bfdcb7 plus the adaptive-bitpool update; parent tab5 base 75a76e7",
   "p4_build": "clean build, idf.py -DIDF_TARGET=esp32p4 build + idf.py merge-bin",
-  "p4_app_sha256": "0bbd0a892f0db6d84c947ae2d36d1626fd9c34e72df49e80db21e35f22efd8d6",
-  "p4_merged_sha256": "49b19cf6cc95cc1b1d0b42378aa8d6851532433f06a41e81c1f486c14ccc38d8",
+  "p4_app_sha256": "3b41ea9f33eb9ec745503ac32458d25d105eb599e204c5e9e7794448d8edaec9",
+  "p4_merged_sha256": "ec6421edc385bab702afc26dc7cb99b020f2748ee3c479b0c465d90bbc1c0868",
   "idf_version": "5.5.5"
 }

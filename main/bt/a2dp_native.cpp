@@ -80,6 +80,11 @@ std::atomic<int> quality_max_pct{12};  // console: a2dp qmax <pct> (test: 0 forc
 std::atomic<int> quality_left{0};
 std::atomic<int64_t> quality_at{0};
 std::atomic<bool> quality_start{false};
+// Adaptive bitpool: with one-slot packets, bitpool 14 needs ~69 % of all central slots. When the peer misses replies
+// (a receiver sharing its radio with its own BLE links: 25-40 % for minutes) the stream would fall behind and break up,
+// so the encoder steps down (14 -> 12 -> 10 -> 8, ~55 % of slots at 10) and back up after 5 clean seconds.
+constexpr int kMinBitpool = 8;
+std::atomic<int> stream_bitpool{14};
 std::atomic<bool> auto_on{false}, user_stop{false};
 // NVS state cached for status() (the UI polls it)
 bool cache_valid = false, cache_peer = false, cache_key = false;
@@ -147,7 +152,7 @@ void hex(char* dst, const uint8_t* v, size_t n) {
 
 struct Connq {
     uint8_t state = 0;
-    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, sbc_level = 0, tx = 0, noreply = 0;
+    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, sbc_level = 0, tx = 0, noreply = 0, sbc_drops = 0;
     bool ok = false;
 };
 Connq connq() {
@@ -163,7 +168,7 @@ Connq connq() {
     q.tx = u32(14);
     if (n >= 101) { q.head = u32(93); q.tail = u32(97); }
     if (n >= 145) q.noreply = u32(141);
-    if (n >= 205) q.sbc_level = u32(193);
+    if (n >= 205) { q.sbc_level = u32(193); q.sbc_drops = u32(197); }
     q.ok = true;
     return q;
 }
@@ -287,6 +292,7 @@ void encoder_task(void*) {
     enc.sbc_mode = SBC_MODE_STD;
     SBC_Encoder_Init(&enc);
     enc.s16BitPool = std::min<int>(kStreamBitpool, st.max_bitpool);
+    stream_bitpool = enc.s16BitPool;
     const int spf = st.blocks * st.subbands;  // samples per channel per frame (128)
     uint8_t frames[4][64];
     uint8_t flen = 0;
@@ -297,6 +303,9 @@ void encoder_task(void*) {
         // real-time pacing with ~40 ms lead into the C6 ring (128 frames there)
         const int64_t due = (esp_timer_get_time() - t0) * st.freq / spf / 1000000 + 14;
         if (static_cast<int64_t>(made) >= due) { vTaskDelay(pdMS_TO_TICKS(4)); continue; }
+        // adaptive bitpool: change only between batches (one frame length per push)
+        enc.s16BitPool = static_cast<SINT16>(std::max<int>(std::max<int>(st.min_bitpool, 2),
+                                                           std::min<int>(stream_bitpool.load(), st.max_bitpool)));
         int nf = 0;
         while (nf < 4 && static_cast<int64_t>(made) < due) {
             int16_t* pcm = enc.as16PcmBuffer;
@@ -458,7 +467,8 @@ bool run_inquiry(int seconds, bool list_all) {
 
 // ---- session ----------------------------------------------------------------------------------------------------
 int rx_early_us = 0;     // RX events open this much before the nominal +625 us (console: a2dp rxearly <us>)
-int conn_ls44 = 1028;    // connection RX window, raw ls44 (console: a2dp connls44 <v>)
+int conn_ls44 = 700;     // connection RX window, raw ls44 (console: a2dp connls44 <v>). 700: an empty RX ends early
+                         // enough to arm the next TX (1028 cost a second slot per missed reply); ~4 % more misses
 int late_skip_us = 500;  // late-hook central slot skip threshold (console: a2dp lateskip <us>, 0 = off)
 
 bool setup_radio() {
@@ -577,6 +587,9 @@ void session_task(void*) {
     int64_t q_from = 0;     // link-quality window: start time, then counters at its start
     uint32_t q_tx0 = 0, q_nr0 = 0;
     bool q_done = false, q_retry = false;
+    int64_t bp_at = 0;     // adaptive bitpool: 1 s windows
+    uint32_t bp_tx = 0, bp_nr = 0, bp_drops = 0;
+    int bp_clean = 0;
     while (ok && !s->stop) {
         const Connq q = connq();
         if (!q.ok) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
@@ -621,6 +634,28 @@ void session_task(void*) {
                     break;
                 }
                 std::printf("A2DP link quality: %lu %% missed replies\n", static_cast<unsigned long>(pct));
+            }
+        }
+        if (s->state == State::Streaming && !s->beep) {
+            const int64_t now = esp_timer_get_time();
+            if (!bp_at) { bp_at = now + 1000000; bp_tx = q.tx; bp_nr = q.noreply; bp_drops = q.sbc_drops; }
+            else if (now >= bp_at && q.tx > bp_tx) {
+                const uint32_t pct = 100 * (q.noreply - bp_nr) / (q.tx - bp_tx);
+                const bool dropped = q.sbc_drops != bp_drops;
+                const int bp = stream_bitpool.load();
+                if ((pct > 15 || dropped) && bp > kMinBitpool) {
+                    stream_bitpool = std::max(kMinBitpool, bp - 2);
+                    bp_clean = 0;
+                    std::printf("A2DP bitpool %d (link %lu %% missed%s)\n", stream_bitpool.load(), static_cast<unsigned long>(pct),
+                                dropped ? ", frames dropped" : "");
+                } else if (pct < 8 && !dropped && bp < kStreamBitpool && ++bp_clean >= 5) {
+                    stream_bitpool = std::min<int>(kStreamBitpool, bp + 2);
+                    bp_clean = 0;
+                    std::printf("A2DP bitpool %d (link %lu %% missed)\n", stream_bitpool.load(), static_cast<unsigned long>(pct));
+                } else if (pct >= 8 || dropped) {
+                    bp_clean = 0;
+                }
+                bp_at = now + 1000000; bp_tx = q.tx; bp_nr = q.noreply; bp_drops = q.sbc_drops;
             }
         }
         br_a2dp_poll(&s->eng);
@@ -837,9 +872,10 @@ void command(const char* line) {
         uint8_t k[16];
         const bool hk = nvs_get("key", k, 16);
         std::printf("A2DP %s | peer %s%02X:%02X:%02X:%02X:%02X:%02X | key %s | tone %d Hz | pcm in %lu (peak %lu) "
-                    "| sbc frames %lu\n", s->status, hp ? "" : "(none) ", peer[5], peer[4], peer[3], peer[2], peer[1],
+                    "| sbc frames %lu | bitpool %d\n", s->status, hp ? "" : "(none) ", peer[5], peer[4], peer[3], peer[2], peer[1],
                     peer[0], hk ? "stored" : "none", tone_hz, static_cast<unsigned long>(pcm_in.load()),
-                    static_cast<unsigned long>(pcm_peak.load()), static_cast<unsigned long>(frames_out.load()));
+                    static_cast<unsigned long>(pcm_peak.load()), static_cast<unsigned long>(frames_out.load()),
+                    stream_bitpool.load());
         return;
     }
     if (!std::strcmp(c, "peer") && n == 3) {

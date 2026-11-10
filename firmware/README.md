@@ -2,7 +2,7 @@
 
 | File | What it is | Flash |
 | --- | --- | --- |
-| `network_adapter.bin` | Custom C6 application image **1.4.251** | C6 installer (below) |
+| `network_adapter.bin` | Custom C6 application image **1.4.252** | C6 installer (below) |
 | `p4/bootloader.bin` | P4 bootloader | `0x2000` |
 | `p4/partition-table.bin` | Partition table (`partitions.csv`) | `0x8000` |
 | `p4/ota_data_initial.bin` | OTA data (boots `ota_0`) | `0xf000` |
@@ -15,12 +15,14 @@ ESP-IDF version. P4 flashing commands are in the [main README](../README.md#flas
 
 ## ESP32-C6 image
 
-`network_adapter.bin` is the custom **1.4.251** C6 application image used by
+`network_adapter.bin` is the custom **1.4.252** C6 application image used by
 this POC: the exact image installed and confirmed on the development Tab5. It is
 an application image, not a merged full-flash image and not P4 firmware.
 1.4.247-1.4.251 add long-FHS paging (`page r2skip`, `page r2late`), an
 FHS-anchored connection slot grid, link diagnostics (`page t3`, `page diag`) and
-the late-hook central slot skip (`page lateskip`); the P4 demo enables them.
+the late-hook central slot skip (`page lateskip`); 1.4.252 stores each SBC
+frame's length so the host can change the bitpool mid-stream. The P4 demo
+enables all of them.
 
 From this directory, verify it with:
 
