@@ -480,6 +480,21 @@ void command(const char* line) {
             p[0] = 7; put32(p + 1, num(a.tok[3]));
             send(Page, p, 5); return;
         }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "r2late")) {  // 1.4.248: shift of the RX after a long FHS (us)
+            p[0] = 25; put16(p + 1, static_cast<uint16_t>(num(a.tok[3])));
+            send(Page, p, 3); return;
+        }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "lateskip")) {  // 1.4.251: late-hook central slot skip (us, 0 off)
+            p[0] = 28; put16(p + 1, static_cast<uint16_t>(num(a.tok[3])));
+            send(Page, p, 3); return;
+        }
+        if (a.n == 3 && !std::strcmp(a.tok[2], "diag")) { p[0] = 27; send(Page, p, 1); return; }  // 1.4.250
+        if (a.n == 4 && !std::strcmp(a.tok[2], "diag")) { p[0] = 27; p[1] = 0; send(Page, p, 2); return; }  // reset
+        if (a.n == 3 && !std::strcmp(a.tok[2], "t3")) { p[0] = 26; send(Page, p, 1); return; }  // long-FHS timing log
+        if (a.n == 4 && !std::strcmp(a.tok[2], "r2skip")) {  // 1.4.247: enter the link without resp2 (long-FHS peers)
+            p[0] = 24; p[1] = static_cast<uint8_t>(num(a.tok[3]) != 0);
+            send(Page, p, 2); return;
+        }
         if (a.n == 4 && !std::strcmp(a.tok[2], "xfix")) {  // fixed reaction X (0..31), "off" = train X
             p[0] = 5; p[1] = !std::strcmp(a.tok[3], "off") ? 0xFF : static_cast<uint8_t>(num(a.tok[3]));
             send(Page, p, 2); return;
@@ -496,7 +511,7 @@ void command(const char* line) {
             put32(p + 14, hexnum(a.tok[8]));
             send(Page, p, 18); return;
         }
-        std::printf("LAB error page: | off | test <X> [end_us] | end <us> | xfix <X|off> | kick <pairs> | r2ls44 <raw> | det <0..3> | rxlog | trace | mask <hex> | conn <lap> <uap> <slots> [rxmax ls44] | connq | connlog <i> | lmp <idx> <start> <repeat> <seqn> [hex] | acl <idx> <start> <repeat> <seqn> <llid> [hex] | enc <on> <kc> <addr> | <tlap> <tuap> <olap> <ouap> <nap> <cod> <clk27_2> (hex)\n");
+        std::printf("LAB error page: | off | test <X> [end_us] | end <us> | xfix <X|off> | kick <pairs> | r2ls44 <raw> | r2skip <0|1> | r2late <us> | t3 | diag [0] | lateskip <us> | det <0..3> | rxlog | trace | mask <hex> | conn <lap> <uap> <slots> [rxmax ls44] | connq | connlog <i> | lmp <idx> <start> <repeat> <seqn> [hex] | acl <idx> <start> <repeat> <seqn> <llid> [hex] | enc <on> <kc> <addr> | <tlap> <tuap> <olap> <ouap> <nap> <cod> <clk27_2> (hex)\n");
         return;
     }
     if (!std::strcmp(c, "rawdump")) {  // rawdump [index]

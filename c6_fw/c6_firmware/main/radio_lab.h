@@ -68,7 +68,14 @@ enum {
 	                   13 = connection counters; 14 = connection packet log entry (index u8);
 	                   16 = LMP queue: idx u8, start slot u16 (65535 ASAP), repeat u8, seqn u8, PDU (1..17 bytes) (1.4.239/241);
 	                   17 = E0 encryption: on u8, Kc' 16, central BD_ADDR 6 (1.4.242);
-	                   18 = like 16 with LLID u8 before the data (1 L2CAP cont., 2 L2CAP start, 3 LMP) (1.4.243); 17 = encryption mode 0 off / 1 RX+TX / 2 RX only (1.4.244); 19 = ACL FIFO push (tag, type, LLID, data), 20 = FIFO mode on/off + first SEQN, 21 = A2DP stream test (built-in SBC beep) (1.4.244, ARQ both ways); 9 = rxed log query; 10 = arming trace query (1.4.227). Needs dtmraw 2 + dtmtrain + dtmhop rx */
+	                   18 = like 16 with LLID u8 before the data (1 L2CAP cont., 2 L2CAP start, 3 LMP) (1.4.243); 17 = encryption mode 0 off / 1 RX+TX / 2 RX only (1.4.244); 19 = ACL FIFO push (tag, type, LLID, data), 20 = FIFO mode on/off + first SEQN, 21 = A2DP stream test (built-in SBC beep) (1.4.244, ARQ both ways); 9 = rxed log query; 10 = arming trace query (1.4.227);
+	                   24 = r2skip u8: enter the link without resp2, FHS length byte 56..80 allowed, provisional link falls back
+	                   to paging after 12 silent central slots (1.4.247); 25 = r2late u16 us: RX after a long FHS late, first
+	                   central TX early by the same amount (1.4.248); 26 = long-FHS timing log + central-slot phase histogram
+	                   (1.4.248/249); 27 = diagnostics query (hook latency, event jumps, late skips), n=2 resets (1.4.250);
+	                   28 = lateskip u16 us: a central TX whose hook runs later than this after the previous start is armed one
+	                   central slot later instead of sliding into the peripheral's slot (1.4.251, 0 = off). Needs dtmraw 2 +
+	                   dtmtrain + dtmhop rx */
 	RL_RAW_DUMP = 0x18, /* n=0: count u8; n=1 index u8: timestamp u32, length u8, bytes after the AA (rawmatch capture) */
 	RL_DTM_HOP = 0x17, /* G4: f1 u8, f2 u8 (MHz-2402, 0xFF keep), interval us u16 (0 keep), on u8 [, rx u8, early us u8,
 	                      window us u16: TX f1 / RX f2 alternating at 625 us]; n=0 query;

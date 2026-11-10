@@ -368,6 +368,27 @@ static volatile uint8_t s_page_act_i = 0xFF;
  * train table entry, so a table whose every entry holds this X's frequencies pages a single X. */
 static volatile uint8_t s_page_xfix = 0xFF;
 static volatile uint32_t s_page_xf_agree, s_page_xf_differ; /* 1.4.245: frequency-derived X vs counter-derived X */
+/* 1.4.247: peers whose DAC tail gives a BLE length byte of 56..80 need an FHS frame longer than one slot, which
+ * overlaps the peripheral's second response (resp2). r2skip: do not wait for resp2, enter the connection after the
+ * FHS anyway, and fall back to paging (provisional end, FIFO kept) when no reply arrives in the first
+ * PAGE_PROV_SLOTS central slots (the FIFO sends nothing before slot 16). */
+#define PAGE_PROV_SLOTS 12u
+static volatile bool s_page_r2skip, s_conn_prov;
+static volatile uint32_t s_page_r2skips, s_conn_prov_ends;
+/* 1.4.248: a long FHS ends after the next event should have been armed, and the scheduler slips a whole slot (C6
+ * log: resp2 RX at FHS+1875). r2late L: start the RX event after an FHS L us late and the following TX (the first
+ * central slot) L us early, so the first POLL stays at FHS+1250. s_t3: actual starts of FHS (absolute), resp2 RX and
+ * the first central TX (both relative to the FHS) for the first 8 FHS. */
+static volatile uint16_t s_page_r2late;
+static volatile int32_t s_itvl_adj;
+static volatile bool s_r2_adj;
+static volatile uint32_t s_t3[8][3];
+static volatile uint8_t s_t3_n, s_t3_i = 0xFF;
+/* 1.4.249: the event index k = round((prev - s_hop_ref) / 625) decides TX/RX by parity. When the connection grid
+ * (set by the FHS) sat ~312 us off the ref grid, k flipped between neighbours (~200 jumps/s, ~20 % of RX events
+ * became TX: 40 % no-reply links). The RX hook after an FHS re-anchors s_hop_ref on the FHS's actual start.
+ * s_conn_phase: histogram of (prev - ref) mod 625 at central-slot hooks, 8 bins of 78 us centred on 0. */
+static volatile uint32_t s_conn_phase[8], s_reanchors;
 /* 1.4.225: reaction emulation (every s_page_kick pairs a TX hook in state 0 acts as if a response arrived, through
  * the identical reactive path) and a separate RX window for the resp2 RX that follows an FHS. 0 = off/same. */
 static volatile uint16_t s_page_kick;
@@ -874,6 +895,17 @@ static uint8_t s_hop_last_f = 0xFF;
 static bool s_hop_last_rx;
 static volatile uint32_t s_hop_dups, s_hop_jumps;
 static uint32_t s_conn_k0;
+/* 1.4.250 diagnostics: hook latency (now - previous start) histogram during the connection, 16 bins of 100 us, and
+ * the first 32 event jumps: k - k0, k - last_k, last event rx, phase (prev - ref) mod 625 + 312 offset, latency. */
+static volatile uint32_t s_lat_hist[2][16];
+static volatile uint32_t s_jl[32][4];
+static volatile uint8_t s_jl_n;
+/* 1.4.251: late-hook slot skip. When the hook that arms a central TX runs more than s_late_skip_us after the previous
+ * (RX) event started, the TX can no longer start at +625: the scheduler would slide it one slot into the peripheral's
+ * slot and break the TX/RX pattern (measured: a missed reply -> long RX -> late hook -> pushed TX -> missed POLL ->
+ * 40 % no-reply links). Instead the TX is armed for the next central slot (k + 2, +1250 us): one POLL lost. */
+static volatile uint16_t s_late_skip_us;
+static volatile uint32_t s_late_skips;
 
 IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 {
@@ -882,10 +914,27 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 	if ((item & 3u) || item < SOC_DRAM_LOW || item >= SOC_DRAM_HIGH - 56) { ++s_hop_bad; return; }
 	const uint32_t prev = *(volatile uint32_t *)((uint8_t *)context + 24); /* previous start */
 	if (s_hop_events == 0) { s_hop_ref = prev; s_hop_last_k = 0xFFFFFFFFu; }
-	const uint32_t k = (uint32_t)(prev - s_hop_ref + 312u) / 625u;
+	uint32_t k = (uint32_t)(prev - s_hop_ref + 312u) / 625u;
 	const bool dup = (k == s_hop_last_k);
 	if (dup) ++s_hop_dups;
-	else if (s_hop_last_k != 0xFFFFFFFFu && k > s_hop_last_k + 1u) ++s_hop_jumps;
+	else if (s_hop_last_k != 0xFFFFFFFFu && k > s_hop_last_k + 1u) {
+		++s_hop_jumps;
+		if (s_page_state == 4 && s_jl_n < 32) {
+			volatile uint32_t *j = s_jl[s_jl_n++];
+			j[0] = k - s_conn_k0; j[1] = (k - s_hop_last_k) | ((uint32_t)s_hop_last_rx << 8) | ((uint32_t)s_conn_prov << 9);
+			j[2] = (prev - s_hop_ref + 312u) % 625u;
+			j[3] = r_ble_lll_timer_current_tick_get() - prev;
+		}
+	}
+	if (s_page_state == 4 && !dup) {
+		const uint32_t lat = (r_ble_lll_timer_current_tick_get() - prev) / 100u;
+		s_lat_hist[s_hop_last_rx ? 1 : 0][lat < 15u ? lat : 15u]++;
+	}
+	bool late_skip = false;
+	if (!dup && s_late_skip_us && s_page_on && s_page_state == 4 && s_hop_rx && (k & 1u) &&
+	    r_ble_lll_timer_current_tick_get() - prev > s_late_skip_us) {
+		k += 2u; late_skip = true; ++s_late_skips;
+	}
 	if (!dup && k < 48) s_hop_start[k] = prev;
 	/* RX mode: event k (k=0 is the 2nd DTM event; the 1st, from schedEvent, is TX) is RX when k is even. */
 	const bool rx = dup ? s_hop_last_rx : (s_hop_rx && !(k & 1));
@@ -918,6 +967,9 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 					s_page_act_i = 0xFF;
 				}
 				if (s_page_state == 2) {
+					if (s_r2_adj) { s_itvl_adj = -(int32_t)s_page_r2late; s_r2_adj = false; }
+					if (s_t3_i < 8) s_t3[s_t3_i][1] = *(volatile uint32_t *)((uint8_t *)context + 24) - s_t3[s_t3_i][0];
+					if (s_page_r2skip && !got) { got = true; ++s_page_r2skips; }
 					if (got) { if (s_page_resp2 < 8) s_page_resp2_k[s_page_resp2] = k; ++s_page_resp2; }
 					else ++s_page_resp2_miss;
 					s_page_state = 0;
@@ -932,10 +984,13 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 						s_rx_saved_last = 0;
 						s_conn_n = 0; s_conn_k0 = k; ++s_conn_entries; s_conn_ready = false;
 						s_conn_last_rx_n = 0; s_conn_end_req = false;
+						s_conn_prov = s_page_r2skip;
 						s_page_state = 4;
 					}
 				}
+				if (s_page_state != 4 && s_t3_i < 8 && s_t3[s_t3_i][1] && !s_t3[s_t3_i][2]) s_t3_i = 0xFF;
 				if (s_page_state == 4) {
+					s_conn_phase[((prev - s_hop_ref + 312u) % 625u) * 8u / 625u]++;
 					uint8_t *body = s_tx_body;
 					s_conn_n = (k - s_conn_k0) >> 1; /* central slot from absolute time */
 					/* drain the controller's received-buffer queue: detector + log source, then hand buffers back */
@@ -985,11 +1040,13 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 							if (s_conn_log_n < CONN_LOG_N) ++s_conn_log_n;
 						}
 					}
-					if (reply_data) s_conn_last_rx_n = s_conn_n;
+					if (reply_data) { s_conn_last_rx_n = s_conn_n; s_conn_prov = false; }
 					const bool sup = s_conn_sup && s_conn_n > s_conn_last_rx_n + s_conn_sup;
 					if (sup) ++s_conn_sup_ends;
 					if (s_conn_end_req) ++s_conn_host_ends;
-					const bool end_now = sup || s_conn_end_req;
+					const bool prov_end = s_conn_prov && s_conn_n >= PAGE_PROV_SLOTS;
+					if (prov_end) ++s_conn_prov_ends;
+					const bool end_now = sup || s_conn_end_req || prov_end;
 					s_conn_end_req = false;
 					if (s_conn_n < s_conn_slots && s_conn_n >= s_conn_fill) ++s_conn_underrun;
 					if (!end_now && s_conn_n < s_conn_slots && s_conn_n < s_conn_fill && body) {
@@ -1013,8 +1070,11 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 						s_cap_now = s_conn_len; s_cap_override = true;
 						++s_conn_tx;
 					} else {
-						/* end of the connection test: back to paging with the DAC */
-						s_fifo_head = s_fifo_tail; s_tx_inflight = 0; s_rx_arqn = 0; s_rxv_state = 0;
+						/* end of the connection test: back to paging with the DAC. A provisional (r2skip) entry that never
+						 * got a reply sent nothing from the FIFO: keep it for the next attempt. */
+						if (!s_conn_prov) s_fifo_head = s_fifo_tail;
+						s_conn_prov = false;
+						s_tx_inflight = 0; s_rx_arqn = 0; s_rxv_state = 0;
 						s_rx_acked_seqn = 0xFF; s_tx_seqn = 1; s_stream_on = false; s_mask_reset = true;
 						s_dtm_raw_aa = s_conn_save_aa; s_dtm_raw_tail = s_conn_save_tail;
 						if (body) conn_set_tail(body, s_conn_save_tail);
@@ -1058,6 +1118,10 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 					}
 				}
 			} else if (s_page_state == 4) {
+				if (s_t3_i < 8) {  /* this hook follows the first central TX: ctx+24 is its actual start */
+					s_t3[s_t3_i][2] = *(volatile uint32_t *)((uint8_t *)context + 24) - s_t3[s_t3_i][0];
+					s_t3_i = 0xFF;
+				}
 				const uint32_t n = (k - s_conn_k0 - 1u) >> 1; /* the central slot this RX follows */
 				if (n < s_conn_slots && n < s_conn_fill) { f = s_conn_f_rx[n % CONN_RING]; s_conn_n = n + 1u; }
 			} else if (s_page_state == 3) {
@@ -1067,6 +1131,14 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 					                                         s_page_dbg[s_page_act_i][0]);
 				f = s_page_resp2_f[s_page_x];
 				s_page_state = 2;
+				if (s_page_r2skip && s_page_r2late) { s_itvl_adj = s_page_r2late; s_r2_adj = true; }
+				s_hop_ref = prev - k * 625u;  /* 1.4.249: the connection's slot grid starts at the FHS */
+				++s_reanchors;
+				if (s_t3_n < 8) {
+					s_t3[s_t3_n][0] = *(volatile uint32_t *)((uint8_t *)context + 24);
+					s_t3[s_t3_n][1] = s_t3[s_t3_n][2] = 0;
+					s_t3_i = s_t3_n++;
+				}
 			}
 		}
 	}
@@ -1095,6 +1167,9 @@ apply:
 	if (s_hop_itvl_us) {
 		uint32_t itvl = s_hop_itvl_us;
 		if (s_hop_rx) itvl = rx ? itvl - s_hop_early + s_hop_late : itvl + s_hop_early - s_hop_late;
+		itvl = (uint32_t)((int32_t)itvl + s_itvl_adj);
+		if (late_skip) itvl += 1250u;
+		s_itvl_adj = 0;
 		*(volatile uint32_t *)((uint8_t *)context + 4) = itvl; /* interval ticks (1 tick = 1 us) */
 		*((volatile uint8_t *)context + 1) = 0;                 /* sub-tick remainder */
 	}
@@ -1358,6 +1433,7 @@ static uint8_t exit_br(void)
 	s_page_force_x = 0xFF;
 	s_page_xfix = 0xFF; s_page_act_i = 0xFF;
 	s_page_kick = 0; s_page_r2_ls44 = 0; s_page_det_rxed = 0; s_page_rxed_got = false;
+	s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false;
 	s_tx_lead = 0; s_rx_max = 0;
 	s_page_tx_end_us = 0;
 	s_page_tx_now = false;
@@ -1638,6 +1714,7 @@ static void handle(const uint8_t *p, uint8_t plen)
 			s_page_tx_now = false; s_page_tx_ctx = NULL;
 			s_page_xfix = 0xFF; s_page_act_i = 0xFF;
 			s_page_kick = 0; s_page_r2_ls44 = 0; s_page_det_rxed = 0; s_page_rxed_got = false;
+			s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false;
 		}
 		if (!a[0]) s_hop_on = s_hop_rx = s_hop_rx_now = s_hop_armed = false;
 		s_dtm_tx_cap = n == 14 ? a[9] : 255;
@@ -1864,6 +1941,38 @@ static void handle(const uint8_t *p, uint8_t plen)
 			s_conn_sup = rd16(a + 1);
 			wr32(out, s_conn_sup); reply(sub, RL_OK, out, 4); break;
 		}
+		if (n == 3 && a[0] == 25 && rd16(a + 1) <= 300) {  /* 1.4.248 r2late u16 us (with r2skip) */
+			s_page_r2late = rd16(a + 1); s_t3_n = 0; s_t3_i = 0xFF; s_itvl_adj = 0; s_r2_adj = false;
+			for (unsigned i = 0; i < 8; ++i) s_conn_phase[i] = 0;
+			s_reanchors = 0;
+			wr16(out, s_page_r2late); reply(sub, RL_OK, out, 2); break;
+		}
+		if (n == 1 && a[0] == 27) {  /* 1.4.250 latency histogram (after TX, after RX) + jump log */
+			for (unsigned r = 0; r < 2; ++r) for (unsigned i = 0; i < 16; ++i) wr32(out + 64 * r + 4 * i, s_lat_hist[r][i]);
+			out[128] = s_jl_n; wr32(out + 209, s_late_skips);
+			for (unsigned i = 0; i < 8; ++i) { wr16(out + 129 + 10 * i, (uint16_t)s_jl[i][0]); wr16(out + 131 + 10 * i, (uint16_t)s_jl[i][1]);
+			                                   wr16(out + 133 + 10 * i, (uint16_t)s_jl[i][2]); wr32(out + 135 + 10 * i, s_jl[i][3]); }
+			reply(sub, RL_OK, out, 213); break;
+		}
+		if (n == 3 && a[0] == 28 && rd16(a + 1) <= 1000) {  /* 1.4.251 late-hook skip threshold us (0 off) */
+			s_late_skip_us = rd16(a + 1); s_late_skips = 0;
+			wr16(out, s_late_skip_us); reply(sub, RL_OK, out, 2); break;
+		}
+		if (n == 2 && a[0] == 27) {  /* reset */
+			memset((void *)s_lat_hist, 0, sizeof s_lat_hist); s_jl_n = 0;
+			reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 1 && a[0] == 26) {  /* 1.4.248 long-FHS timing log */
+			out[0] = s_t3_n;
+			for (unsigned i = 0; i < 8; ++i) for (unsigned j = 0; j < 3; ++j) wr32(out + 1 + 12 * i + 4 * j, s_t3[i][j]);
+			for (unsigned i = 0; i < 8; ++i) wr32(out + 97 + 4 * i, s_conn_phase[i]);
+			wr32(out + 129, s_reanchors);
+			reply(sub, RL_OK, out, 133); break;
+		}
+		if (n == 2 && a[0] == 24) {  /* 1.4.247 r2skip u8 (0 off, 1 on) */
+			s_page_r2skip = a[1] != 0; s_page_r2skips = 0; s_conn_prov_ends = 0;
+			out[0] = s_page_r2skip; reply(sub, RL_OK, out, 1); break;
+		}
 		if (n == 1 && a[0] == 23) {  /* 1.4.245 end the connection at the next central slot (after an LMP detach) */
 			s_conn_end_req = s_page_state == 4;
 			out[0] = s_conn_end_req; reply(sub, RL_OK, out, 1); break;
@@ -1944,7 +2053,7 @@ static void handle(const uint8_t *p, uint8_t plen)
 			reply(sub, RL_OK, out, 3 + LMP_PKT_BYTES); break;
 		}
 		if (n == 1 && a[0] == 13) {  /* connection counters (1.4.234 layout) */
-			out[0] = s_conn_armed; out[1] = s_page_state; wr32(out + 2, s_conn_n); wr32(out + 6, s_conn_slots);
+			out[0] = s_conn_armed; out[1] = (s_page_state == 4 && s_conn_prov) ? 5 : s_page_state; wr32(out + 2, s_conn_n); wr32(out + 6, s_conn_slots);
 			wr32(out + 10, s_conn_entries); wr32(out + 14, s_conn_tx); wr32(out + 18, s_conn_rx);
 			wr32(out + 22, s_conn_underrun); out[26] = s_conn_log_n; out[27] = s_conn_ready;
 			for (unsigned i = 0; i < 16; ++i) wr16(out + 28 + 2 * i, s_conn_rx_first[i]);
@@ -1965,7 +2074,9 @@ static void handle(const uint8_t *p, uint8_t plen)
 			wr32(out + 189, s_stream_skips);
 			/* 1.4.246 host SBC ring */
 			wr32(out + 193, s_sbc_w - s_sbc_r); wr32(out + 197, s_sbc_drops); wr32(out + 201, s_sbc_in);
-			reply(sub, RL_OK, out, 205); break;
+			/* 1.4.247 r2skip */
+			wr32(out + 205, s_page_r2skips); wr32(out + 209, s_conn_prov_ends); out[213] = s_page_r2skip;
+			reply(sub, RL_OK, out, 214); break;
 		}
 		if (n == 2 && a[0] == 15 && a[1] < 4) {  /* buffer trace, 8 slots per page */
 			for (unsigned i = 0; i < 8; ++i) { wr32(out + 8 * i, s_conn_buf_trace[8 * a[1] + i][0]); wr32(out + 8 * i + 4, s_conn_buf_trace[8 * a[1] + i][1]); }
@@ -2099,7 +2210,8 @@ static void handle(const uint8_t *p, uint8_t plen)
 		 * Require room for the 40 payload octets carrying the FHS, and bound the
 		 * extra tail to the longest measured packet that still fits this slot. */
 		const uint8_t tx_len = (uint8_t)(s_dtm_raw_tail >> 8);
-		if (tx_len < 40 || tx_len > 55) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+		/* 1.4.247: 56..80 only with r2skip (the frame overlaps the resp2 slot; 80 ends ~740 us, before the next TX) */
+		if (tx_len < 40 || tx_len > (s_page_r2skip ? 80 : 55)) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
 		static br_pkt_t pkt;
 		static uint8_t air[BR_PACKET_MAX_BYTES];
 		br_fhs_t fh = { .parity = br_fhs_parity_for_lap(olap), .lap = olap, .eir = 0, .sr = 1, .uap = ouap,

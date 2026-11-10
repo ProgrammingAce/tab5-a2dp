@@ -1,9 +1,26 @@
-# Matching ESP32-C6 firmware
+# Prebuilt firmware
 
-`network_adapter.bin` is the custom **1.4.246** C6 application image used by
-this POC. Its SHA-256 is recorded in `SHA256SUMS`; `provenance.json` records the
-source commits and ESP-IDF version. It is an application image, not a merged
-full-flash image and not P4 firmware.
+| File | What it is | Flash |
+| --- | --- | --- |
+| `network_adapter.bin` | Custom C6 application image **1.4.251** | C6 installer (below) |
+| `p4/bootloader.bin` | P4 bootloader | `0x2000` |
+| `p4/partition-table.bin` | Partition table (`partitions.csv`) | `0x8000` |
+| `p4/ota_data_initial.bin` | OTA data (boots `ota_0`) | `0xf000` |
+| `p4/tab5_a2dp_demo.bin` | P4 demo application | `0x20000` |
+| `p4/flash_args` | The four P4 files above for `esptool write_flash "@flash_args"` | |
+| `p4/tab5_a2dp_demo_merged.bin` | Same P4 build as one image; erases the NVS bond | `0x0` |
+
+All SHA-256 sums are in `SHA256SUMS`; `provenance.json` records the sources and
+ESP-IDF version. P4 flashing commands are in the [main README](../README.md#flash-the-prebuilt-firmware).
+
+## ESP32-C6 image
+
+`network_adapter.bin` is the custom **1.4.251** C6 application image used by
+this POC: the exact image installed and confirmed on the development Tab5. It is
+an application image, not a merged full-flash image and not P4 firmware.
+1.4.247-1.4.251 add long-FHS paging (`page r2skip`, `page r2late`), an
+FHS-anchored connection slot grid, link diagnostics (`page t3`, `page diag`) and
+the late-hook central slot skip (`page lateskip`); the P4 demo enables them.
 
 From this directory, verify it with:
 

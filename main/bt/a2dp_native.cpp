@@ -72,6 +72,14 @@ TaskHandle_t task = nullptr, enc_task = nullptr;
 // auto-reconnect: attempts left and when the next one may start (us); user_stop cancels them
 std::atomic<int> reconnect_left{0};
 std::atomic<int64_t> reconnect_at{0};
+// Link-quality retry: some peers (the Galaxy projector speaker) time-share their radio with their own BLE links, and
+// each connection lands at a random phase to them: ~2 % or 25-40 % missed replies for the life of the link. After
+// streaming starts we measure, and reconnect from a bad phase (each try is a fresh roll).
+constexpr int kQualityRetries = 3;
+std::atomic<int> quality_max_pct{12};  // console: a2dp qmax <pct> (test: 0 forces the retries)
+std::atomic<int> quality_left{0};
+std::atomic<int64_t> quality_at{0};
+std::atomic<bool> quality_start{false};
 std::atomic<bool> auto_on{false}, user_stop{false};
 // NVS state cached for status() (the UI polls it)
 bool cache_valid = false, cache_peer = false, cache_key = false;
@@ -139,7 +147,7 @@ void hex(char* dst, const uint8_t* v, size_t n) {
 
 struct Connq {
     uint8_t state = 0;
-    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, sbc_level = 0;
+    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, sbc_level = 0, tx = 0, noreply = 0;
     bool ok = false;
 };
 Connq connq() {
@@ -152,7 +160,9 @@ Connq connq() {
     q.n = u32(2);
     q.entries = u32(10);
     q.count = u32(89);
+    q.tx = u32(14);
     if (n >= 101) { q.head = u32(93); q.tail = u32(97); }
+    if (n >= 145) q.noreply = u32(141);
     if (n >= 205) q.sbc_level = u32(193);
     q.ok = true;
     return q;
@@ -447,6 +457,10 @@ bool run_inquiry(int seconds, bool list_all) {
 }
 
 // ---- session ----------------------------------------------------------------------------------------------------
+int rx_early_us = 0;     // RX events open this much before the nominal +625 us (console: a2dp rxearly <us>)
+int conn_ls44 = 1028;    // connection RX window, raw ls44 (console: a2dp connls44 <v>)
+int late_skip_us = 500;  // late-hook central slot skip threshold (console: a2dp lateskip <us>, 0 = off)
+
 bool setup_radio() {
     const uint32_t plap = s->peer[0] | s->peer[1] << 8 | static_cast<uint32_t>(s->peer[2]) << 16;
     const uint8_t puap = s->peer[3];
@@ -481,15 +495,34 @@ bool setup_radio() {
     }
     lab("lab dtmtrain cfg 32 128");
     lab("lab page off");
+    // The C6 sends the FHS as a BLE DTM frame whose length byte is bits 8..15 of the peer's access-code tail. Up to
+    // 55 it fits one slot; 56..80 (e.g. a speaker with LAP E91187 -> 70) overlaps the peer's second response, so the
+    // C6 enters the link without waiting for it (C6 1.4.247+, falls back to paging if the peer never answers).
+    const unsigned fhs_len = (tail >> 8) & 0xFFu;
+    if (fhs_len > 55 && lab("lab page r2skip 1") != 0) {
+        set_status("these headphones need C6 firmware 1.4.247+ (long FHS)");
+        return false;
+    }
+    if (fhs_len <= 55) lab("lab page r2skip 0");
+    // The long FHS ends after the next event should be armed and the C6 scheduler slips a slot: start the RX after it
+    // 200 us late (short window) and the first central TX 200 us early, keeping the first POLL at FHS + 1250 us.
+    lab(fhs_len > 55 ? "lab page r2late 200" : "lab page r2late 0");
     std::snprintf(line, sizeof line, "lab page %06lX %02X %06lX %02X 0000 5A020C 0", static_cast<unsigned long>(plap),
                   puap, static_cast<unsigned long>(kOwnLap), kOwnUap);
     if (lab(line) != 0) { set_status("page setup refused"); return false; }
-    std::snprintf(line, sizeof line, "lab page conn %06lX %02X 65535 40 1028", static_cast<unsigned long>(kOwnLap), kOwnUap);
+    std::snprintf(line, sizeof line, "lab page conn %06lX %02X 65535 40 %d", static_cast<unsigned long>(kOwnLap), kOwnUap,
+                  conn_ls44);
     if (lab(line) != 0) { set_status("connection setup refused"); return false; }
     if (lab("lab page fiforeset 1 1") != 0) { set_status("C6 has no ACL FIFO (needs 1.4.244+)"); return false; }
+    // A hook that runs too late to arm the next central TX skips that slot instead of letting the scheduler slide
+    // the TX into the peripheral's slot (C6 1.4.251; older firmware refuses the command and keeps the old behaviour).
+    std::snprintf(line, sizeof line, "lab page lateskip %d", late_skip_us);
+    lab(line);
     lab("lab page mask FF");
     lab("lab page det 2");
-    if (lab("lab dtmhop 2467 2456 625 rx 0 700 1") != 0) return false;
+    if (fhs_len > 55) lab("lab page r2ls44 250");  // the delayed RX after a long FHS ends early enough for the POLL
+    std::snprintf(line, sizeof line, "lab dtmhop 2467 2456 625 rx %d 700 1", rx_early_us);
+    if (lab(line) != 0) return false;
     lab("lab dtmhop rxmax 4");
     if (lab("lab dtm tx 19 42 0", nullptr, nullptr, 3000) != 0) { set_status("DTM start failed"); return false; }
     return true;
@@ -541,6 +574,9 @@ void session_task(void*) {
         set_status("paging the headphones");
     }
     const int64_t t_start = esp_timer_get_time();
+    int64_t q_from = 0;     // link-quality window: start time, then counters at its start
+    uint32_t q_tx0 = 0, q_nr0 = 0;
+    bool q_done = false, q_retry = false;
     while (ok && !s->stop) {
         const Connq q = connq();
         if (!q.ok) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
@@ -572,6 +608,21 @@ void session_task(void*) {
             ++s->log_seen;
             if (lab(line, e, &en) == 0) feed_log_entry(e, en);
         }
+        if (s->state == State::Streaming && !q_done) {
+            const int64_t now = esp_timer_get_time();
+            if (!q_from) q_from = now + 1000000;  // let the stream settle for 1 s
+            else if (!q_tx0 && now >= q_from) { q_tx0 = q.tx; q_nr0 = q.noreply; }
+            else if (q_tx0 && now >= q_from + 2000000 && q.tx > q_tx0 + 500) {
+                q_done = true;
+                const uint32_t pct = 100 * (q.noreply - q_nr0) / (q.tx - q_tx0);
+                if (static_cast<int>(pct) > quality_max_pct && quality_left > 0 && !s->beep) {
+                    set_status("link quality poor (%lu %% missed): reconnecting", static_cast<unsigned long>(pct));
+                    q_retry = true;
+                    break;
+                }
+                std::printf("A2DP link quality: %lu %% missed replies\n", static_cast<unsigned long>(pct));
+            }
+        }
         br_a2dp_poll(&s->eng);
         if (s->state == State::Streaming && !s->beep && !enc_task)
             xTaskCreatePinnedToCore(encoder_task, "a2dp_sbc", 6144, nullptr, 7, &enc_task, 1);
@@ -593,7 +644,12 @@ void session_task(void*) {
     }
     cleanup_radio();
     const bool lost = !std::strncmp(s->status, "link lost", 9) || !std::strncmp(s->status, "headphones did not", 18);
-    if (std::strncmp(s->status, "failed", 6) && std::strncmp(s->status, "headphones", 10) && !lost) set_status("stopped");
+    if (std::strncmp(s->status, "failed", 6) && std::strncmp(s->status, "headphones", 10) && !lost && !q_retry)
+        set_status("stopped");
+    if (q_retry && !user_stop) {
+        --quality_left;
+        quality_at = esp_timer_get_time() + 2 * 1000000LL;
+    }
     if (auto_on && !user_stop && lost && was_connected) {  // unexpected loss of a working link: try again
         if (reconnect_left <= 0) reconnect_left = 3;
         reconnect_at = esp_timer_get_time() + 5 * 1000000LL;
@@ -641,6 +697,7 @@ bool start(bool pair, bool beep, bool find = false, bool find_only = false) {
     ring_w = 0;
     ring_r = 0;
     user_stop = false;
+    if (!quality_start.exchange(false)) { quality_left = kQualityRetries; quality_at = 0; }
     xTaskCreatePinnedToCore(session_task, "a2dp_native", 8192, nullptr, 6, &task, 1);
     return true;
 }
@@ -648,6 +705,13 @@ bool start(bool pair, bool beep, bool find = false, bool find_only = false) {
 void supervisor_task(void*) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!task && !user_stop && quality_at && esp_timer_get_time() >= quality_at) {
+            quality_at = 0;
+            std::printf("A2DP reconnecting for link quality (%d tries left)\n", quality_left.load());
+            quality_start = true;
+            if (!start(false, false)) quality_start = false;
+            continue;
+        }
         if (!auto_on || user_stop || task || reconnect_left <= 0 || esp_timer_get_time() < reconnect_at) continue;
         --reconnect_left;
         std::printf("A2DP auto-reconnect (%d left)\n", reconnect_left.load());
@@ -794,6 +858,26 @@ void command(const char* line) {
         for (int i = 0; i < 16; ++i) le[i] = be[15 - i];
         nvs_put("key", le, 16);
         std::printf("A2DP key stored\n");
+        return;
+    }
+    if (!std::strcmp(c, "qmax") && n == 3) {
+        quality_max_pct = std::max(-1, std::min(100, std::atoi(tok[2])));
+        std::printf("A2DP link-quality reconnect above %d %% missed replies\n", quality_max_pct.load());
+        return;
+    }
+    if (!std::strcmp(c, "lateskip") && n == 3) {
+        late_skip_us = std::max(0, std::min(1000, std::atoi(tok[2])));
+        std::printf("A2DP late-hook slot skip %d us (next connect)\n", late_skip_us);
+        return;
+    }
+    if (!std::strcmp(c, "connls44") && n == 3) {
+        conn_ls44 = std::max(400, std::min(1100, std::atoi(tok[2])));
+        std::printf("A2DP connection RX window ls44 %d (next connect)\n", conn_ls44);
+        return;
+    }
+    if (!std::strcmp(c, "rxearly") && n == 3) {
+        rx_early_us = std::max(0, std::min(150, std::atoi(tok[2])));
+        std::printf("A2DP RX early %d us (next connect)\n", rx_early_us);
         return;
     }
     if (!std::strcmp(c, "tone") && n == 3) {

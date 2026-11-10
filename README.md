@@ -66,7 +66,7 @@ internal tone off before feeding external PCM.
   configuration.
 - ESP-IDF **5.5.5**, target `esp32p4` for the demo.
 - Ordinary Bluetooth Classic A2DP headphones or speaker.
-- C6 running the custom **1.4.246** image in `firmware/network_adapter.bin`,
+- C6 running the custom **1.4.251** image in `firmware/network_adapter.bin`,
   installed and confirmed before launching the P4 demo. Stock Tab5 C6 firmware
   cannot run this implementation. See [C6 firmware](firmware/README.md).
 
@@ -74,6 +74,31 @@ The project configuration supplies the Tab5 wiring: SDIO slot 1, four-bit bus at
 40 MHz, CMD 13, CLK 12, D0 11, D1 10, D2 9, D3 8, active-low C6 reset on GPIO
 15. The BSP powers the C6 rail through the board's I/O expander. PSRAM and a 1
 kHz FreeRTOS tick are enabled.
+
+## Flash the prebuilt firmware
+
+`firmware/p4/` holds a ready-to-flash build of this demo (ESP-IDF 5.5.5,
+`esp32p4`, P4 revisions 0.x/1.x). Verify it from `firmware/` with
+`shasum -a 256 -c SHA256SUMS`, close other serial monitors, then, from
+`firmware/p4/`:
+
+```sh
+python -m esptool --chip esp32p4 -p /dev/cu.usbmodem1101 -b 460800 \
+  --before default_reset --after hard_reset write_flash "@flash_args"
+```
+
+This writes the bootloader, partition table, OTA data and application and
+keeps the `a2dpn` NVS data (saved peer and bond). For a fresh board,
+`tab5_a2dp_demo_merged.bin` is the same build as one image written at offset
+`0x0`; because it spans the NVS partition it **erases any saved bond**:
+
+```sh
+python -m esptool --chip esp32p4 -p /dev/cu.usbmodem1101 -b 460800 \
+  write_flash 0x0 tab5_a2dp_demo_merged.bin
+```
+
+Either way the C6 needs the matching 1.4.251 image (see
+[C6 firmware](firmware/README.md)); the P4 images do not install it.
 
 ## Build and run
 
@@ -149,6 +174,19 @@ clears its key. `a2dp auto 1` enables bounded reconnect, including after boot;
 resetting or reflashing: silent link loss can make a receiver temporarily refuse
 another connection.
 
+Two link safeguards run automatically. Receivers whose address makes the C6's
+FHS frame longer than one slot (BLE DTM length byte 56..80, for example a
+speaker with LAP `E91187`) are paged with the long-FHS mode: the C6 does not wait
+for their second page response, delays that receive slot so the first POLL
+keeps its timing, and returns to paging if the receiver never answers. After
+streaming starts, the P4 measures missed replies for two seconds and reconnects
+when more than 12 % are missed, up to three times (about six seconds of silence
+each). Some receivers share their radio with their own BLE links, and each
+connection lands at a random timing offset to them; a fresh connection usually
+avoids a bad offset. `a2dp qmax <pct>` changes the threshold (-1 forces the
+retries for testing); `a2dp lateskip`, `a2dp connls44` and `a2dp rxearly` are
+radio tuning controls that apply to the next connection.
+
 The convenience command `a2dp pair` discovers and pairs the first audio device
 it finds; explicit discovery and address selection are preferable around
 multiple devices. `a2dp connect beep` loops the C6's built-in SBC beep for
@@ -168,13 +206,27 @@ diagnostics; the P4 tone demonstrates the full PCM and encoder path.
 | `components/espressif__esp_hosted/` | Patched P4 SDIO and HCI transport |
 | `c6_fw/c6_firmware/` | C6 controller hooks and Classic radio implementation |
 | `c6_fw/cis_ll/` | Supporting engine used by the C6 firmware |
-| `firmware/` | Matching C6 image, checksum and provenance |
+| `firmware/` | Matching C6 image, prebuilt P4 images (`p4/`), checksums and provenance |
 
 The P4 demo starts the display and touch. The BSP brings its usual transitive
 build dependencies. The C6 firmware also includes LE Audio support and an update
 guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
+
+**2026-11-10, C6 1.4.247-1.4.251 update.** The radio changes (long-FHS paging,
+late-hook slot skip, FHS-anchored slot grid) and the link-quality reconnect were
+developed and measured in the parent Tab5 firmware on a Galaxy Projector Speaker
+(LAP `E91187`, length byte 70): page in 0.1-3.5 s, SSP pairing, encrypted
+streaming; ten consecutive connections at 1-8 % missed replies with no dropped
+SBC frames, and three forced quality retries that reconnected cleanly. Before the
+slot-skip fix about half of all connections ran at 25-40 % missed replies with
+audible breakup. The prebuilt images in `firmware/` are the shipped C6 image that
+was installed and confirmed on that Tab5, and a clean P4 build of this demo. This
+demo's own P4 build has not yet been flashed and run on hardware, and the Bose
+headphones used for the earlier work have not been retested with 1.4.251.
+
+**Earlier validation.**
 
 The touchscreen POC was flashed to a Tab5 with P4 revision 1.3 on 2026-11-10.
 Boot logs confirm a 1280 x 720 landscape display, ST712x touch initialization,
