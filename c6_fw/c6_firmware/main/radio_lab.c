@@ -36,6 +36,7 @@
  * Which of these actually retune (and how fast) is what gates G1/G2 measure.
  */
 #include "radio_lab.h"
+#include "cis_c6.h"
 #include "br/br.h"
 #include "br/br_fast.h"
 #include "sbc_beep.h"
@@ -47,6 +48,7 @@
 #include "esp_bt.h"
 #include "esp_log.h"
 #include "esp_phy_cert_test.h"
+#include "esp_rom_regi2c.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -380,6 +382,28 @@ static volatile uint32_t s_page_r2skips, s_conn_prov_ends;
  * central slot) L us early, so the first POLL stays at FHS+1250. s_t3: actual starts of FHS (absolute), resp2 RX and
  * the first central TX (both relative to the FHS) for the first 8 FHS. */
 static volatile uint16_t s_page_r2late;
+/* 1.4.253 shifted FHS (any peer address). The FHS goes out as a DTM frame whose AA + 16-bit header carry sync bits
+ * 0..47, so its BLE length byte was the peer's sync bits 40..47: only 40..80 could be paged (~16 % of addresses; the
+ * frame must hold the FHS and end before the peer's next reply). With shift on, the whole BR packet (preamble, sync,
+ * trailer, header, FHS payload: 366 bits) starts right after the BLE header instead, so the header is ours: length
+ * PAGE_SHIFT_LEN for every peer. The AA (sync bits 0..31) stays, the event starts PAGE_SHIFT_US early so the BR
+ * access code is on air exactly where it was (AA start - 4 us before, AA start + 48 us now), and the next event
+ * starts that much later. The frame ends ~390 us after the BR packet start: resp2 needs no r2skip. */
+#define PAGE_SHIFT_LEN 46u /* ceil(366 / 8) */
+#define PAGE_SHIFT_US 52u
+static volatile bool s_page_shift;
+static uint8_t s_page_fhs_full[32][PAGE_SHIFT_LEN]; /* air bits 0..365 */
+static volatile uint32_t s_page_shift_sent;
+/* 1.4.263: BR modulation index. PHY register 0x600A043C bits 0..23 over 0x600A0438 scales the TX deviation (BLE 0.5;
+ * 0x9BF7CE/0xF3B333 -> h 0.35, measured). Set for TX events only (written before each event is armed): with the
+ * scaled value in force across received packets the link's TX carrier ends up ~150 kHz low. 0 = off. */
+#define MOD_REG 0x600A043Cu
+static volatile uint32_t s_mod_tx, s_mod_orig;
+/* 1.4.264: the register scales the receiver too (DTM RX of h 0.5 packets: 225 vs 1748), so receive with the original
+ * value. The hook for an RX event runs 300-400 us into the preceding TX packet: wait until that packet has ended
+ * (its start + s_mod_tx_us, bounded) before restoring. Connection state only (paging keeps the BLE value). */
+static volatile uint16_t s_mod_tx_us = 430;
+static volatile uint32_t s_mod_waits, s_mod_wait_max;
 static volatile int32_t s_itvl_adj;
 static volatile bool s_r2_adj;
 static volatile uint32_t s_t3[8][3];
@@ -419,6 +443,22 @@ static volatile uint32_t s_page_rxed_log[8][2];
 static volatile uint32_t s_tr[3][3][6];
 static volatile uint8_t s_tr_row, s_tr_stage = 0xFF;
 static volatile bool s_tr_pending;
+
+/* 1.4.259: RF frequency memory (libphy phy_hw_freq.o): per-channel entries the hardware writes to the RF PLL over
+ * I2C at each channel change. pll_dac_mem_update_new(v) stores one value in all 85 type-1 entries ("PLL DAC"):
+ * candidate for the FSK modulation gain (BLE h 0.5 vs BR 0.28-0.35). */
+/* 1.4.262: the PHY's own I2C master (RF blocks 0x62/0x63/0x67, host 1); host | 0x80 = system regi2c path */
+extern uint8_t rom_chip_i2c_readReg(uint32_t block, uint32_t host, uint32_t reg);
+extern void rom_chip_i2c_writeReg(uint32_t block, uint32_t host, uint32_t reg, uint32_t data);
+extern uint32_t get_freq_mem_param(int which);
+extern uint32_t get_freq_mem_addr(uint32_t a, uint32_t b, uint32_t chan, uint32_t type);
+extern uint32_t read_rf_freq_mem_new(uint32_t addr, uint32_t sel);
+extern void pll_dac_mem_update_new(uint32_t v);
+static uint32_t freq_mem_read(uint32_t chan, uint32_t type, uint32_t sel)
+{
+	const uint32_t prm = get_freq_mem_param(2);
+	return read_rf_freq_mem_new(get_freq_mem_addr((prm >> 16) & 0xFFu, (prm >> 8) & 0xFFu, chan, type), sel);
+}
 
 /* Same read path as raw_match_worker (DTM RX buffer behind ls+8): fresh timestamp and word == sync bits 32..63. */
 /* 1.4.232: page detection compare mask, see lab page mask (RL_PAGE mode 11). */
@@ -619,8 +659,17 @@ static uint8_t s_sbc_ring[SBC_RING_N][SBC_FRAME_MAX];
 static uint8_t s_sbc_len[SBC_RING_N]; /* 1.4.252: per-frame length (the host adapts the bitpool mid-stream) */
 static volatile uint32_t s_sbc_w, s_sbc_r, s_sbc_drops, s_sbc_in;
 static volatile uint8_t s_sbc_flen, s_stream_src; /* source: 1 built-in beep, 2 host frames */
+/* 1.4.258: media in DM1 (2/3 FEC, 17 bytes) instead of DH1 (27 bytes, no FEC): for sinks that lose payload bits */
+static volatile bool s_stream_dm1;
+static volatile uint8_t s_stream_frag; /* 1.4.260: DH1 fragment bytes (0 = 27); diagnostics: success vs length */
 
 IRAM_ATTR static inline uint32_t fifo_count(void) { return s_fifo_tail - s_fifo_head; }
+/* 1.4.254: per-channel link statistics (RF channel 0..78 = 2402..2480 MHz): central slots and slots without a reply,
+ * by our TX channel and by the peripheral's reply channel. Wi-Fi shows up as a block of ~20 bad channels, radio
+ * time-sharing in the peer as uniform loss. lab page chanq [0]. */
+static uint32_t s_ch_tx_n[79], s_ch_tx_miss[79], s_ch_rx_n[79], s_ch_rx_miss[79];
+/* 1.4.255: the peripheral's reply to our data packets (decoded headers only): ARQN=1, FLOW=0 (stop), packet type */
+static uint32_t s_rep_n, s_rep_arqn1, s_rep_flow0, s_rep_type[16];
 
 /* The ISR part, called at the TX hook of central slot n with the reply to slot n-1 (data = RX buffer or 0). Writes
  * this slot's packet into dst (= body + 4, LMP_PKT_BYTES). */
@@ -638,8 +687,18 @@ IRAM_ATTR static void fifo_slot(uint8_t *dst, uint32_t n, uint32_t data, bool is
 	} else if (n > 0) {
 		++s_rx_noreply;
 	}
+	if (n > 0) {
+		const uint8_t ftx = s_conn_f_tx[(n - 1u) % CONN_RING], frx = s_conn_f_rx[(n - 1u) % CONN_RING];
+		if (ftx < 79 && frx < 79) {
+			++s_ch_tx_n[ftx]; ++s_ch_rx_n[frx];
+			if (!data) { ++s_ch_tx_miss[ftx]; ++s_ch_rx_miss[frx]; }
+		}
+	}
 	const uint32_t type = (v >> 3) & 15u, peer_arqn = (v >> 8) & 1u, peer_seqn = (v >> 9) & 1u;
 	/* 2. our packet of slot n-1: acknowledged? */
+	if (s_tx_inflight && hdr_ok) {
+		++s_rep_n; s_rep_arqn1 += peer_arqn; s_rep_flow0 += !((v >> 7) & 1u); ++s_rep_type[type];
+	}
 	if (s_tx_inflight) {
 		if (hdr_ok && peer_arqn) { s_fifo_head = s_fifo_head + 1u; s_tx_seqn ^= 1u; ++s_fifo_acked; }
 		else ++s_fifo_retx;
@@ -777,7 +836,8 @@ static void stream_task(void *unused)
 			if (!s_sbc_flen || s_sbc_w - s_sbc_r < fpp) { vTaskDelay(1); continue; }
 			unsigned body = 13u;
 			for (unsigned f = 0; f < fpp; ++f) body += s_sbc_len[(s_sbc_r + f) % SBC_RING_N];
-			const unsigned total = 4u + body, frags = (total + 26u) / 27u;
+			const unsigned fl = s_stream_dm1 ? 17u : (s_stream_frag ? s_stream_frag : 27u);
+			const unsigned total = 4u + body, frags = (total + fl - 1u) / fl;
 			if (FIFO_N - fifo_count() < frags) { ++s_stream_full; vTaskDelay(1); continue; }
 			pkt[0] = (uint8_t)body; pkt[1] = (uint8_t)(body >> 8); pkt[2] = (uint8_t)s_stream_dcid; pkt[3] = (uint8_t)(s_stream_dcid >> 8);
 			uint8_t *r = pkt + 4;
@@ -790,8 +850,8 @@ static void stream_task(void *unused)
 				o += s_sbc_len[e];
 			}
 			s_sbc_r = s_sbc_r + fpp;
-			for (unsigned off = 0; off < total; off += 27u)
-				(void)fifo_push(BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < 27u ? total - off : 27u);
+			for (unsigned off = 0; off < total; off += fl)
+				(void)fifo_push(s_stream_dm1 ? BR_TYPE_DM1 : BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < fl ? total - off : fl);
 			ts += fpp * 128u; ++seq; ++s_stream_pkts; s_stream_frames += fpp;
 			continue;
 		}
@@ -994,6 +1054,7 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 						s_page_state = 4;
 					}
 				}
+				if (s_page_state == 0 && s_page_shift && s_tx_body) conn_set_tail(s_tx_body, s_dtm_raw_tail);
 				if (s_page_state != 4 && s_t3_i < 8 && s_t3[s_t3_i][1] && !s_t3[s_t3_i][2]) s_t3_i = 0xFF;
 				if (s_page_state == 4) {
 					s_conn_phase[((prev - s_hop_ref + 312u) % 625u) * 8u / 625u]++;
@@ -1101,10 +1162,19 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 					++s_page_resp1;
 					uint8_t *body = s_tx_body;
 					if (body && (uint32_t)body >= SOC_DRAM_LOW && (uint32_t)body < SOC_DRAM_HIGH - 64) {
-						const uint8_t *src = s_page_fhs[s_page_x];
-						for (unsigned i = 0; i < PAGE_FHS_BYTES; ++i) body[4 + i] = src[i];
+						if (s_page_shift) {
+							const uint8_t *src = s_page_fhs_full[s_page_x];
+							body[0] = 0; body[1] = PAGE_SHIFT_LEN;  /* PDU type 0, no CTE; our length */
+							for (unsigned i = 0; i < PAGE_SHIFT_LEN; ++i) body[2 + i] = src[i];
+							s_cap_now = PAGE_SHIFT_LEN; s_cap_override = true;
+							s_itvl_adj -= (int32_t)PAGE_SHIFT_US;
+							++s_page_shift_sent;
+						} else {
+							const uint8_t *src = s_page_fhs[s_page_x];
+							for (unsigned i = 0; i < PAGE_FHS_BYTES; ++i) body[4 + i] = src[i];
+							s_cap_now = s_page_tx_cap; s_cap_override = true;
+						}
 						f = s_page_fhs_f[s_page_x];
-						s_cap_now = s_page_tx_cap; s_cap_override = true;
 						++s_page_fhs_sent;
 						s_page_state = 3;
 						s_tr_pending = true;
@@ -1138,7 +1208,8 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 				f = s_page_resp2_f[s_page_x];
 				s_page_state = 2;
 				if (s_page_r2skip && s_page_r2late) { s_itvl_adj = s_page_r2late; s_r2_adj = true; }
-				s_hop_ref = prev - k * 625u;  /* 1.4.249: the connection's slot grid starts at the FHS */
+				if (s_page_shift) s_itvl_adj += (int32_t)PAGE_SHIFT_US;  /* the FHS event started that much early */
+				s_hop_ref = prev + (s_page_shift ? PAGE_SHIFT_US : 0u) - k * 625u;  /* 1.4.249: grid starts at the FHS */
 				++s_reanchors;
 				if (s_t3_n < 8) {
 					s_t3[s_t3_n][0] = *(volatile uint32_t *)((uint8_t *)context + 24);
@@ -1149,6 +1220,21 @@ IRAM_ATTR static void dtm_hop_event(void *context, void *descriptor)
 		}
 	}
 apply:
+	if (s_mod_tx) {
+		volatile uint32_t *mr = (volatile uint32_t *)MOD_REG;
+		if (s_page_state != 4) {
+			if (*mr != s_mod_orig) *mr = s_mod_orig;
+		} else if (!rx) {
+			*mr = s_mod_tx;  /* the reply in the RX event before has ended */
+		} else {
+			const uint32_t start = *(volatile uint32_t *)((uint8_t *)context + 24);  /* the TX event still on air */
+			const uint32_t t0 = r_ble_lll_timer_current_tick_get();
+			uint32_t now = t0;
+			while ((int32_t)(now - (start + s_mod_tx_us)) < 0 && now - t0 < 250u) now = r_ble_lll_timer_current_tick_get();
+			if (now != t0) { ++s_mod_waits; if (now - t0 > s_mod_wait_max) s_mod_wait_max = now - t0; }
+			*mr = s_mod_orig;
+		}
+	}
 	if (f <= 78) {
 		volatile uint32_t *w = (volatile uint32_t *)item;
 		w[5] = (w[5] & 0xFFFF80FFu) | ((uint32_t)f << 8);
@@ -1439,7 +1525,7 @@ static uint8_t exit_br(void)
 	s_page_force_x = 0xFF;
 	s_page_xfix = 0xFF; s_page_act_i = 0xFF;
 	s_page_kick = 0; s_page_r2_ls44 = 0; s_page_det_rxed = 0; s_page_rxed_got = false;
-	s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false;
+	s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false; s_page_shift = false; if (s_mod_tx) { *(volatile uint32_t *)MOD_REG = s_mod_orig; s_mod_tx = 0; }
 	s_tx_lead = 0; s_rx_max = 0;
 	s_page_tx_end_us = 0;
 	s_page_tx_now = false;
@@ -1707,12 +1793,14 @@ static void handle(const uint8_t *p, uint8_t plen)
 	s_last_cmd_us = esp_timer_get_time();
 
 	const bool needs_br = !(sub == RL_PING || sub == RL_ENTER_BR || sub == RL_EXIT_BR || sub == RL_REBOOT ||
-				sub == RL_FORCE || sub == RL_CHANMAP || sub == RL_SCAN_AA || sub == RL_IRQ_STATS || sub == RL_SCAN_FLAGS || sub == RL_DTM_STATS || sub == RL_SCAN_RAW || sub == RL_RAW_MATCH || sub == RL_QUIET || sub == RL_DTM_RAW || sub == RL_DTM_HOP || sub == RL_RAW_DUMP || sub == RL_DTM_TRAIN || sub == RL_PAGE);
+				sub == RL_FORCE || sub == RL_CHANMAP || sub == RL_SCAN_AA || sub == RL_IRQ_STATS || sub == RL_SCAN_FLAGS || sub == RL_DTM_STATS || sub == RL_SCAN_RAW || sub == RL_RAW_MATCH || sub == RL_QUIET || sub == RL_DTM_RAW || sub == RL_DTM_HOP || sub == RL_RAW_DUMP || sub == RL_DTM_TRAIN || sub == RL_PAGE ||
+				sub == RL_PEEK || sub == RL_POKE); /* 1.4.256: radio registers during DTM (window still enforced) */
 	if (needs_br && !s_br_mode) { reply(sub, RL_ERR_DISALLOWED, NULL, 0); return; }
 
 	switch (sub) {
 	case RL_DTM_RAW: {
-		if ((n != 9 && n != 14) || a[0] > 2 || (a[0] == 2 && a[6] > 127)) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+		/* 1.4.253: any BLE length byte (sync bits 40..47): IDs use cap0, page responses rxmax, the FHS page shift */
+		if ((n != 9 && n != 14) || a[0] > 2) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
 		if (fw_guard_in_trial()) { reply(sub, RL_ERR_TRIAL, NULL, 0); break; }
 		s_dtm_raw_mode = a[0]; s_dtm_raw_aa = rd32(a+1); s_dtm_raw_tail = rd32(a+5);
 		if (!s_dtm_raw_mode) {
@@ -1720,7 +1808,7 @@ static void handle(const uint8_t *p, uint8_t plen)
 			s_page_tx_now = false; s_page_tx_ctx = NULL;
 			s_page_xfix = 0xFF; s_page_act_i = 0xFF;
 			s_page_kick = 0; s_page_r2_ls44 = 0; s_page_det_rxed = 0; s_page_rxed_got = false;
-			s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false;
+			s_page_r2skip = false; s_conn_prov = false; s_late_skip_us = 0; s_page_r2late = 0; s_itvl_adj = 0; s_r2_adj = false; s_page_shift = false; if (s_mod_tx) { *(volatile uint32_t *)MOD_REG = s_mod_orig; s_mod_tx = 0; }
 		}
 		if (!a[0]) s_hop_on = s_hop_rx = s_hop_rx_now = s_hop_armed = false;
 		s_dtm_tx_cap = n == 14 ? a[9] : 255;
@@ -1975,6 +2063,71 @@ static void handle(const uint8_t *p, uint8_t plen)
 			wr32(out + 129, s_reanchors);
 			reply(sub, RL_OK, out, 133); break;
 		}
+		if (n == 1 && a[0] == 30) {  /* 1.4.254 per-channel miss %: 79 by TX channel, 79 by reply channel (255 = no data) */
+			for (unsigned c = 0; c < 79; ++c) {
+				out[c] = s_ch_tx_n[c] ? (uint8_t)(100u * s_ch_tx_miss[c] / s_ch_tx_n[c]) : 255u;
+				out[79 + c] = s_ch_rx_n[c] ? (uint8_t)(100u * s_ch_rx_miss[c] / s_ch_rx_n[c]) : 255u;
+			}
+			wr32(out + 158, s_rep_n); wr32(out + 162, s_rep_arqn1); wr32(out + 166, s_rep_flow0);
+			for (unsigned i = 0; i < 16; ++i) wr32(out + 170 + 4 * i, s_rep_type[i]);
+			reply(sub, RL_OK, out, 234); break;
+		}
+		if (n == 4 && a[0] == 33) {  /* 1.4.259 freq memory read: chan u8, type u8, sel u8 -> u32, + param u32 */
+			wr32(out, freq_mem_read(a[1], a[2], a[3])); wr32(out + 4, get_freq_mem_param(2));
+			reply(sub, RL_OK, out, 8); break;
+		}
+		if (n == 5 && a[0] == 34) {  /* 1.4.259 pll_dac_mem_update_new(u32) */
+			pll_dac_mem_update_new(rd32(a + 1)); reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 5 && a[0] == 38) {  /* 1.4.263 TX-event modulation value u32 (0 = off, restores the original) */
+			const uint32_t v = rd32(a + 1);
+			if (v && !s_mod_tx) s_mod_orig = *(volatile uint32_t *)MOD_REG;
+			if (!v && s_mod_tx) *(volatile uint32_t *)MOD_REG = s_mod_orig;
+			s_mod_tx = v;
+			wr32(out, s_mod_orig); reply(sub, RL_OK, out, 4); break;
+		}
+		if (n == 3 && a[0] == 39) {  /* 1.4.264 TX packet end for the RX restore, us after the TX start (300..600) */
+			const uint16_t us = rd16(a + 1);
+			if (us < 300 || us > 600) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+			s_mod_tx_us = us; reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 1 && a[0] == 39) {  /* query: on u8, value u32, orig u32, waits u32, max wait us u32, end us u16 */
+			out[0] = s_mod_tx != 0; wr32(out + 1, s_mod_tx); wr32(out + 5, s_mod_orig); wr32(out + 9, s_mod_waits);
+			wr32(out + 13, s_mod_wait_max); wr16(out + 17, s_mod_tx_us); reply(sub, RL_OK, out, 19); break;
+		}
+		if (n == 2 && a[0] == 32) {  /* 1.4.258 media fragments in DM1 u8 (0 = DH1) */
+			s_stream_dm1 = a[1] != 0; out[0] = s_stream_dm1; reply(sub, RL_OK, out, 1); break;
+		}
+		if (n == 4 && a[0] == 36) {  /* 1.4.261 analog I2C read: block u8, host u8, reg u8 -> u8 */
+			out[0] = a[2] & 0x80 ? esp_rom_regi2c_read(a[1], a[2] & 0x7F, a[3]) : rom_chip_i2c_readReg(a[1], a[2], a[3]);
+			reply(sub, RL_OK, out, 1); break;
+		}
+		if (n == 5 && a[0] == 37) {  /* 1.4.261 analog I2C write: block, host, reg, value */
+			if (a[2] & 0x80) esp_rom_regi2c_write(a[1], a[2] & 0x7F, a[3], a[4]);
+			else rom_chip_i2c_writeReg(a[1], a[2], a[3], a[4]);
+			reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 2 && a[0] == 35) {  /* 1.4.260 DH1 fragment length 1..27 (0 = 27) */
+			if (a[1] > 27) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+			s_stream_frag = a[1]; out[0] = a[1]; reply(sub, RL_OK, out, 1); break;
+		}
+		if (n == 2 && a[0] == 31) {  /* 1.4.257 TX power dBm (3/6/9/12/15/18/20): BLE default + connections (DTM) */
+			if (!cis_c6_knob_set(CIS_C6_KNOB_TX_DBM, a[1])) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+			out[0] = a[1]; reply(sub, RL_OK, out, 1); break;
+		}
+		if (n == 2 && a[0] == 30) {  /* reset */
+			memset(s_ch_tx_n, 0, sizeof s_ch_tx_n); memset(s_ch_tx_miss, 0, sizeof s_ch_tx_miss);
+			memset(s_ch_rx_n, 0, sizeof s_ch_rx_n); memset(s_ch_rx_miss, 0, sizeof s_ch_rx_miss);
+			s_rep_n = s_rep_arqn1 = s_rep_flow0 = 0; memset(s_rep_type, 0, sizeof s_rep_type);
+			reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 2 && a[0] == 29) {  /* 1.4.253 shifted FHS u8 (0 off, 1 on); set before mode 1 */
+			s_page_shift = a[1] != 0; s_page_shift_sent = 0;
+			out[0] = s_page_shift; reply(sub, RL_OK, out, 1); break;
+		}
+		if (n == 1 && a[0] == 29) {  /* query: on u8, shifted FHS sent u32 */
+			out[0] = s_page_shift; wr32(out + 1, s_page_shift_sent); reply(sub, RL_OK, out, 5); break;
+		}
 		if (n == 2 && a[0] == 24) {  /* 1.4.247 r2skip u8 (0 off, 1 on) */
 			s_page_r2skip = a[1] != 0; s_page_r2skips = 0; s_conn_prov_ends = 0;
 			out[0] = s_page_r2skip; reply(sub, RL_OK, out, 1); break;
@@ -2217,7 +2370,7 @@ static void handle(const uint8_t *p, uint8_t plen)
 		 * extra tail to the longest measured packet that still fits this slot. */
 		const uint8_t tx_len = (uint8_t)(s_dtm_raw_tail >> 8);
 		/* 1.4.247: 56..80 only with r2skip (the frame overlaps the resp2 slot; 80 ends ~740 us, before the next TX) */
-		if (tx_len < 40 || tx_len > (s_page_r2skip ? 80 : 55)) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+		if (!s_page_shift && (tx_len < 40 || tx_len > (s_page_r2skip ? 80 : 55))) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
 		static br_pkt_t pkt;
 		static uint8_t air[BR_PACKET_MAX_BYTES];
 		br_fhs_t fh = { .parity = br_fhs_parity_for_lap(olap), .lap = olap, .eir = 0, .sr = 1, .uap = ouap,
@@ -2239,12 +2392,15 @@ static void handle(const uint8_t *p, uint8_t plen)
 			memset(s_page_fhs[x], 0, PAGE_FHS_BYTES);
 			for (unsigned b = 0; b < 366 - 68; ++b)
 				if (br_bit_get(air, 68 + b)) s_page_fhs[x][b >> 3] |= (uint8_t)(1u << (b & 7));
+			memset(s_page_fhs_full[x], 0, PAGE_SHIFT_LEN);
+			for (unsigned b = 0; b < 366; ++b)
+				if (br_bit_get(air, b)) s_page_fhs_full[x][b >> 3] |= (uint8_t)(1u << (b & 7));
 			s_page_fhs_f[x] = (uint8_t)br_hop_slave_page_response(a28, x << 12, (x << 12) | 4u, 1);
 			s_page_resp2_f[x] = (uint8_t)br_hop_slave_page_response(a28, x << 12, (x << 12) | 6u, 1);
 		}
 		if (!ok) { reply(sub, RL_ERR_INTERNAL, NULL, 0); break; }
 		s_page_state = 0; s_page_last_stamp = 0;
-		s_page_tx_cap = tx_len;
+		s_page_tx_cap = s_page_shift ? PAGE_SHIFT_LEN : tx_len;
 		s_page_force_x = 0xFF;
 		s_page_tx_end_us = 0;
 		s_page_on = true;

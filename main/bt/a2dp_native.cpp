@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,9 @@ constexpr uint8_t kMaxBitpool = 20;     // our SEP; the link budget is one DH1 p
 constexpr uint8_t kStreamBitpool = 14;  // 41-byte frames: 15 per packet = 24 DH1 per 43.5 ms, ~69 % of TX slots
 
 enum class State : uint8_t { Idle, Setup, Paging, Connected, Streaming, Stopping };
+// Connect: a saved device with its key. Pair: one address, fresh pairing. Search: list discoverable devices until
+// the user picks one (then pair it). SearchPair: pair the first audio device found (console `a2dp pair`).
+enum class Kind : uint8_t { Connect, Pair, Search, SearchPair };
 
 struct Found {
     uint8_t addr[6];  // LSB first
@@ -49,9 +53,14 @@ struct Found {
 };
 
 struct Session {
-    bool pair = false, beep = false, find = false, find_only = false;
-    Found found[8];
-    int nfound = 0;
+    Kind kind = Kind::Connect;
+    bool pair = false, beep = false;
+    Found found[kMaxFound];
+    std::atomic<int> nfound{0};
+    std::atomic<int> pick{-1};          // Search: the found device the user tapped
+    std::atomic<bool> searching{false};
+    bool peer_valid = false;            // peer holds the address of the last session
+    uint32_t peer_cod = 0;
     std::atomic<State> state{State::Idle};
     std::atomic<bool> stop{false};
     br_a2dp_t eng;
@@ -63,6 +72,7 @@ struct Session {
     uint8_t kc[16] = {};
     uint32_t log_seen = 0, entries0 = 0;
     bool connected = false;
+    uint8_t detach_reason = 0;  // the sink's LMP_detach reason (0 = none)
     br_a2dp_stream_t stream = {};
     char status[96] = "idle";
 };
@@ -80,6 +90,9 @@ std::atomic<int> quality_max_pct{12};  // console: a2dp qmax <pct> (test: 0 forc
 std::atomic<int> quality_left{0};
 std::atomic<int64_t> quality_at{0};
 std::atomic<bool> quality_start{false};
+// A sink that still holds our previous link (its supervision timeout, up to 20 s, has not run out, e.g. our LMP detach
+// got lost on a poor link) refuses the next one with 0x0B "connection already exists": wait and try again.
+std::atomic<int> stale_left{0};
 // Adaptive bitpool: with one-slot packets, bitpool 14 needs ~69 % of all central slots. When the peer misses replies
 // (a receiver sharing its radio with its own BLE links: 25-40 % for minutes) the stream would fall behind and break up,
 // so the encoder steps down (14 -> 12 -> 10 -> 8, ~55 % of slots at 10) and back up after 5 clean seconds.
@@ -87,13 +100,8 @@ constexpr int kMinBitpool = 8;
 std::atomic<int> stream_bitpool{14};
 std::atomic<bool> auto_on{false}, user_stop{false};
 // NVS state cached for status() (the UI polls it)
-bool cache_valid = false, cache_peer = false, cache_key = false;
-uint8_t cache_peer_addr[6] = {};
 bool verbose = false;
 int tone_hz = 0;
-Device discovered[8];
-size_t discovered_count = 0;
-portMUX_TYPE discovery_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // PCM ring (interleaved stereo int16) between write_pcm() and the encoder task
 constexpr size_t kRingFrames = 8192;  // ~186 ms at 44.1 kHz
@@ -121,13 +129,119 @@ bool nvs_get(const char* k, uint8_t* out, size_t n) {
     return ok;
 }
 void nvs_put(const char* k, const uint8_t* v, size_t n) {
-    cache_valid = false;
     nvs_handle_t h;
     if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return;
     if (v) nvs_set_blob(h, k, v, n);
     else nvs_erase_key(h, k);
     nvs_commit(h);
     nvs_close(h);
+}
+
+// ---- saved headphones (NVS "devs": most recently used first; [0] is the default / auto-reconnect target) --------
+struct Saved {
+    uint8_t addr[6];  // LSB first
+    uint8_t key[16];
+    uint8_t has_key, rsvd;
+    uint32_t cod;
+    char name[BR_A2DP_NAME_MAX + 1];
+};
+Saved saved_list[kMaxSaved];
+int saved_n = 0;
+SemaphoreHandle_t saved_mu = nullptr;
+struct SavedLock {
+    SavedLock() { xSemaphoreTake(saved_mu, portMAX_DELAY); }
+    ~SavedLock() { xSemaphoreGive(saved_mu); }
+};
+
+// under the lock
+void saved_store() {
+    nvs_put("devs", reinterpret_cast<const uint8_t*>(saved_list), saved_n * sizeof(Saved));
+    if (!saved_n) nvs_put("devs", nullptr, 0);
+}
+void saved_load() {
+    SavedLock l;
+    saved_n = 0;
+    nvs_handle_t h;
+    size_t len = sizeof saved_list;
+    bool have = false;
+    if (nvs_open(kNs, NVS_READONLY, &h) == ESP_OK) {
+        have = nvs_get_blob(h, "devs", saved_list, &len) == ESP_OK && len % sizeof(Saved) == 0;
+        nvs_close(h);
+    }
+    if (have) {
+        saved_n = static_cast<int>(len / sizeof(Saved));
+        for (int i = 0; i < saved_n; ++i) saved_list[i].name[BR_A2DP_NAME_MAX] = '\0';
+        return;
+    }
+    // older firmware kept one device: "peer" + "key"
+    Saved d = {};
+    if (!nvs_get("peer", d.addr, 6)) return;
+    d.has_key = nvs_get("key", d.key, 16);
+    saved_list[0] = d;
+    saved_n = 1;
+    saved_store();
+    nvs_put("peer", nullptr, 0);
+    nvs_put("key", nullptr, 0);
+}
+int saved_find(const uint8_t* a) {
+    for (int i = 0; i < saved_n; ++i)
+        if (!std::memcmp(saved_list[i].addr, a, 6)) return i;
+    return -1;
+}
+void saved_to_front(int i) {
+    if (i <= 0) return;
+    const Saved d = saved_list[i];
+    std::memmove(saved_list + 1, saved_list, i * sizeof(Saved));
+    saved_list[0] = d;
+}
+// Adds or updates a device (key: nullptr keeps the stored one) and makes it the default.
+void saved_upsert(const uint8_t* addr, const uint8_t* key, uint32_t cod, const char* name) {
+    SavedLock l;
+    int i = saved_find(addr);
+    if (i < 0) {
+        if (saved_n < kMaxSaved) ++saved_n;  // full: the least recently used one drops off the end
+        i = saved_n - 1;
+        saved_list[i] = {};
+        std::memcpy(saved_list[i].addr, addr, 6);
+    }
+    if (key) { std::memcpy(saved_list[i].key, key, 16); saved_list[i].has_key = 1; }
+    if (cod) saved_list[i].cod = cod;
+    if (name && *name) std::snprintf(saved_list[i].name, sizeof saved_list[i].name, "%s", name);
+    saved_to_front(i);
+    saved_store();
+}
+
+void fmt_addr(char* out, size_t n, const uint8_t* a) {
+    std::snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
+}
+bool parse_addr(const char* t, uint8_t* le) {  // "AA:BB:CC:DD:EE:FF" or 12 hex digits, MSB first
+    uint8_t be[6];
+    int k = 0;
+    for (const char* c = t; *c && k < 12; ++c) {
+        if (*c == ':') continue;
+        const char ch = static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
+        int v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (v < 0) return false;
+        if (k % 2 == 0) be[k / 2] = static_cast<uint8_t>(v << 4);
+        else be[k / 2] |= static_cast<uint8_t>(v);
+        ++k;
+    }
+    if (k != 12) return false;
+    for (int i = 0; i < 6; ++i) le[i] = be[5 - i];
+    return true;
+}
+
+// The C6 sends the FHS as a BLE DTM frame. Without the shift (C6 < 1.4.253) the frame's length byte is bits 8..15 of
+// the peer's access-code tail: 40..55 is the normal case, 56..80 works with r2skip/r2late (C6 1.4.248+), other
+// addresses cannot be paged. C6 1.4.253 `lab page shift 1` sends the BR packet after our own BLE header: any address.
+constexpr unsigned kMaxFhsLen = 80;
+bool c6_shift = true;     // the C6 accepted `lab page shift 1` (refreshed at every setup)
+bool use_shift = true;    // console: a2dp shift <0|1> (0 = the old length-byte path, for comparison)
+bool pageable(unsigned fhs_len) { return (c6_shift && use_shift) || (fhs_len >= 40 && fhs_len <= kMaxFhsLen); }
+unsigned fhs_len_for(const uint8_t* addr) {
+    uint32_t aa, tail, crc;
+    br_page_dtm_id(addr[0] | addr[1] << 8 | static_cast<uint32_t>(addr[2]) << 16, &aa, &tail, &crc);
+    return (tail >> 8) & 0xFFu;
 }
 
 // ---- lab helpers ------------------------------------------------------------------------------------------------
@@ -190,12 +304,16 @@ bool fifo_push(uint8_t type, uint8_t llid, const uint8_t* d, size_t n) {
 }
 
 // ---- engine I/O -------------------------------------------------------------------------------------------------
+bool l2_dm1 = false;
+int l2_frag = 0;  // console: a2dp frag <1..27> (DH1 media fragment bytes; 0 = 27)
 void io_send(void*, uint8_t llid, const uint8_t* d, size_t n) {
     if (llid == 3) {
         fifo_push(3, 3, d, n);  // LMP in DM1
         return;
     }
-    for (size_t off = 0; off < n; off += 27) fifo_push(4, off ? 1 : 2, d + off, n - off < 27 ? n - off : 27);
+    // DH1 (27 bytes, no FEC) or DM1 (17 bytes, 2/3 FEC) per l2_dm1 (console: a2dp dm1 <0|1>)
+    const size_t frag = l2_dm1 ? 17 : 27;
+    for (size_t off = 0; off < n; off += frag) fifo_push(l2_dm1 ? 3 : 4, off ? 1 : 2, d + off, n - off < frag ? n - off : frag);
 }
 void io_set_enc(void*, int mode, const uint8_t kc[16], const uint8_t addr[6]) {
     char k[33], a[13], line[80];
@@ -216,18 +334,35 @@ void io_event(void*, int ev, const void* arg) {
     case BR_A2DP_EV_PAIRED:
         std::memcpy(s->key, arg, 16);
         s->have_key = true;
-        nvs_put("key", s->key, 16);
-        set_status("paired; link key stored");
+        saved_upsert(s->peer, s->key, s->peer_cod, nullptr);
+        set_status("paired; saved");
         break;
+    case BR_A2DP_EV_NAME: {
+        const char* name = static_cast<const char*>(arg);
+        SavedLock l;
+        const int i = saved_find(s->peer);
+        if (i >= 0 && std::strcmp(saved_list[i].name, name)) {
+            std::snprintf(saved_list[i].name, sizeof saved_list[i].name, "%s", name);
+            saved_store();
+        }
+        break;
+    }
     case BR_A2DP_EV_ENCRYPTED: set_status("encrypted"); break;
     case BR_A2DP_EV_STREAMING: {
         s->stream = *static_cast<const br_a2dp_stream_t*>(arg);
+        lab(l2_dm1 ? "lab page dm1 1" : "lab page dm1 0");
+        { char fl[32]; std::snprintf(fl, sizeof fl, "lab page frag %d", l2_frag); lab(fl); }
         char line[64];
         if (s->beep) std::snprintf(line, sizeof line, "lab page stream 1 %04X %d 0", s->stream.media_cid, kFramesPerPacket);
         else std::snprintf(line, sizeof line, "lab page stream 2 %04X %d 0", s->stream.media_cid, kFramesPerPacket);
         lab(line);
         s->state = State::Streaming;
         reconnect_left = 0;
+        {  // the device that plays becomes the default (auto-reconnect target)
+            SavedLock l;
+            const int i = saved_find(s->peer);
+            if (i > 0) { saved_to_front(i); saved_store(); }
+        }
         set_status("streaming SBC %lu Hz, bitpool <= %u%s", static_cast<unsigned long>(s->stream.freq),
                    s->stream.max_bitpool, s->beep ? " (C6 beep test)" : "");
         break;
@@ -237,11 +372,18 @@ void io_event(void*, int ev, const void* arg) {
         s->stop = true;
         break;
     case BR_A2DP_EV_DETACHED:
+        s->detach_reason = *static_cast<const uint8_t*>(arg);
         set_status("headphones disconnected (0x%02X)", *static_cast<const uint8_t*>(arg));
         s->stop = true;
         break;
     case BR_A2DP_EV_SUSPENDED:
-        set_status("headphones suspended the stream");
+        // no media while suspended (AVDTP): the C6 stops sending, the encoder ends; the engine sends START again
+        // and BR_A2DP_EV_STREAMING re-arms both
+        if (s->state == State::Streaming) {
+            lab("lab page stream 0 0 1 0");
+            s->state = State::Connected;
+        }
+        set_status("headphones paused the stream: restarting");
         break;
     default: break;
     }
@@ -349,18 +491,15 @@ bool audio_class(uint32_t cod) { return ((cod >> 8) & 0x1Fu) == 0x04u; }  // maj
 void add_found(const br_fhs_t& f) {
     uint8_t a[6] = {static_cast<uint8_t>(f.lap), static_cast<uint8_t>(f.lap >> 8), static_cast<uint8_t>(f.lap >> 16), f.uap,
                     static_cast<uint8_t>(f.nap), static_cast<uint8_t>(f.nap >> 8)};
-    for (int i = 0; i < s->nfound; ++i)
+    const int nf = s->nfound;
+    for (int i = 0; i < nf; ++i)
         if (!std::memcmp(s->found[i].addr, a, 6)) { ++s->found[i].hits; return; }
-    if (s->nfound >= 8) return;
-    Found& n = s->found[s->nfound++];
+    if (nf >= kMaxFound) return;
+    Found& n = s->found[nf];
     std::memcpy(n.addr, a, 6);
     n.cod = f.cod;
     n.hits = 1;
-    portENTER_CRITICAL(&discovery_mux);
-    Device& d = discovered[discovered_count++];
-    std::snprintf(d.address, sizeof d.address, "%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
-    d.audio = audio_class(f.cod);
-    portEXIT_CRITICAL(&discovery_mux);
+    s->nfound = nf + 1;  // published after the entry is complete (status() reads it from the UI task)
     std::printf("A2DP found %02X:%02X:%02X:%02X:%02X:%02X class %06lX%s\n", a[5], a[4], a[3], a[2], a[1], a[0],
                 static_cast<unsigned long>(f.cod), audio_class(f.cod) ? " (audio)" : "");
 }
@@ -393,9 +532,7 @@ void decode_capture(const uint8_t* d, size_t n) {
 // list_all). The C6 is left with DTM and hopping off (setup_radio configures paging from there).
 bool run_inquiry(int seconds, bool list_all) {
     s->nfound = 0;
-    portENTER_CRITICAL(&discovery_mux);
-    discovered_count = 0;
-    portEXIT_CRITICAL(&discovery_mux);
+    s->pick = -1;
     uint8_t b[240];
     size_t n = sizeof b;
     if (lab("lab ping", b, &n) != 0 || n < 3) { set_status("C6 lab not answering"); return false; }
@@ -431,7 +568,7 @@ bool run_inquiry(int seconds, bool list_all) {
     if (lab("lab dtm tx 19 37 0", nullptr, nullptr, 3000) != 0) return false;
     set_status("searching for headphones in pairing mode");
     const int64_t until = esp_timer_get_time() + static_cast<int64_t>(seconds) * 1000000;
-    while (esp_timer_get_time() < until && !s->stop) {
+    while (esp_timer_get_time() < until && !s->stop && s->pick < 0) {
         std::snprintf(line, sizeof line, "lab rawmatch 4000 %08lX 3 64 450", static_cast<unsigned long>(tail));
         const int rc = radio_lab::exec(line, nullptr, nullptr, 1500);
         if (rc != 1 && rc != 0) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }  // 1 = started
@@ -460,6 +597,8 @@ bool run_inquiry(int seconds, bool list_all) {
         bool audio = false;
         for (int i = 0; i < s->nfound; ++i) audio |= audio_class(s->found[i].cod);
         if (audio && !list_all) break;
+        if (s->pick < 0 && !s->stop)
+            set_status("searching for headphones in pairing mode: %d found", s->nfound.load());
     }
     for (const char* l : {"lab dtm off", "lab dtmhop off", "lab dtmtrain cfg 0 1", "lab dtmraw 0 0 0"}) lab(l);
     return true;
@@ -471,6 +610,49 @@ int conn_ls44 = 700;     // connection RX window, raw ls44 (console: a2dp connls
                          // enough to arm the next TX (1028 cost a second slot per missed reply); ~4 % more misses
 int late_skip_us = 500;  // late-hook central slot skip threshold (console: a2dp lateskip <us>, 0 = off)
 
+int tx_dbm = 0;  // console: a2dp txpwr <3..20> (0 = C6 default, +9 dBm)
+// Modulation index. The C6 sends BLE GFSK (h ~0.5); BR receivers expect 0.28-0.35 and some (the Sennheiser HDB 630)
+// lose ~1.5 % of payload bits at 0.5. Two BT baseband TX registers scale the deviation cleanly (HackRF run-length
+// profile stays GFSK-shaped, carrier unchanged): 0x600A200C bits 8..11, a signed trim (-8..+7, bt_bb_v2_tx_set writes
+// 1), and 0x600A20EC bits 24..31, part of the TX filter setup (0xEC). Trim -8 with 0x40 -> h 0.33 (BR nominal 0.32).
+// 0x600A043C (DCO gain) is NOT usable: it detunes two-point modulation and scales the receiver too.
+constexpr uint32_t kTrimReg = 0x600A200C, kFiltReg = 0x600A20EC;
+uint32_t br_filt = 0x40;      // console: a2dp brmod <20EC byte 3 hex | 0 = BLE modulation>
+uint32_t br_trim = 8;         // console: a2dp brtrim <0..15> (8 = -8)
+bool mod_on = false;
+uint32_t mod_trim_saved = 0, mod_filt_saved = 0;
+uint32_t peek32(uint32_t addr, bool* ok) {
+    char line[40];
+    std::snprintf(line, sizeof line, "lab peek %08lX 1", static_cast<unsigned long>(addr));
+    uint8_t b[8];
+    size_t n = sizeof b;
+    *ok = lab(line, b, &n) == 0 && n >= 4;
+    return *ok ? (b[0] | b[1] << 8 | b[2] << 16 | static_cast<uint32_t>(b[3]) << 24) : 0;
+}
+void poke32(uint32_t addr, uint32_t v) {
+    char line[48];
+    std::snprintf(line, sizeof line, "lab poke %08lX %08lX", static_cast<unsigned long>(addr), static_cast<unsigned long>(v));
+    lab(line);
+}
+void mod_apply() {
+    if (!br_filt || mod_on) return;
+    bool ok1 = false, ok2 = false;
+    mod_trim_saved = peek32(kTrimReg, &ok1);
+    mod_filt_saved = peek32(kFiltReg, &ok2);
+    if (!ok1 || !ok2) { std::printf("A2DP modulation: registers not readable (C6 1.4.256+)\n"); return; }
+    mod_on = true;
+    poke32(kTrimReg, (mod_trim_saved & ~0xF00u) | ((br_trim & 0xFu) << 8));
+    poke32(kFiltReg, (mod_filt_saved & 0x00FFFFFFu) | (br_filt << 24));
+    std::printf("A2DP BR modulation: trim %lu, filter %02lX (was %08lX / %08lX)\n", static_cast<unsigned long>(br_trim),
+                static_cast<unsigned long>(br_filt), static_cast<unsigned long>(mod_trim_saved),
+                static_cast<unsigned long>(mod_filt_saved));
+}
+void mod_restore() {
+    if (!mod_on) return;
+    poke32(kTrimReg, mod_trim_saved);
+    poke32(kFiltReg, mod_filt_saved);
+    mod_on = false;
+}
 bool setup_radio() {
     const uint32_t plap = s->peer[0] | s->peer[1] << 8 | static_cast<uint32_t>(s->peer[2]) << 16;
     const uint8_t puap = s->peer[3];
@@ -482,6 +664,11 @@ bool setup_radio() {
     if (lab("lab quiet 1") != 0) { set_status("could not enter BR mode"); return false; }
     lab("lab dtmstats 0");
     lab("lab dtmstats 5");
+    if (tx_dbm) {
+        char pl[32];
+        std::snprintf(pl, sizeof pl, "lab page txpwr %d", tx_dbm);
+        if (lab(pl) != 0) std::printf("A2DP TX power %d dBm refused (C6 1.4.257+, 3/6/9/12/15/18/20)\n", tx_dbm);
+    }
     uint32_t aa, tail, crc;
     br_page_dtm_id(plap, &aa, &tail, &crc);
     char line[160];
@@ -508,7 +695,14 @@ bool setup_radio() {
     // The C6 sends the FHS as a BLE DTM frame whose length byte is bits 8..15 of the peer's access-code tail. Up to
     // 55 it fits one slot; 56..80 (e.g. a speaker with LAP E91187 -> 70) overlaps the peer's second response, so the
     // C6 enters the link without waiting for it (C6 1.4.247+, falls back to paging if the peer never answers).
-    const unsigned fhs_len = (tail >> 8) & 0xFFu;
+    unsigned fhs_len = (tail >> 8) & 0xFFu;
+    c6_shift = lab(use_shift ? "lab page shift 1" : "lab page shift 0") == 0;
+    const bool shift = c6_shift && use_shift;
+    if (shift) fhs_len = 46;  // the C6's own header: one-slot frame for every peer
+    if (!pageable(fhs_len)) {
+        set_status("these headphones need C6 firmware 1.4.253+ (FHS length %u)", fhs_len);
+        return false;
+    }
     if (fhs_len > 55 && lab("lab page r2skip 1") != 0) {
         set_status("these headphones need C6 firmware 1.4.247+ (long FHS)");
         return false;
@@ -517,6 +711,7 @@ bool setup_radio() {
     // The long FHS ends after the next event should be armed and the C6 scheduler slips a slot: start the RX after it
     // 200 us late (short window) and the first central TX 200 us early, keeping the first POLL at FHS + 1250 us.
     lab(fhs_len > 55 ? "lab page r2late 200" : "lab page r2late 0");
+    std::printf("A2DP paging: FHS %s (length %u)\n", shift ? "shifted" : "in the sync tail", fhs_len);
     std::snprintf(line, sizeof line, "lab page %06lX %02X %06lX %02X 0000 5A020C 0", static_cast<unsigned long>(plap),
                   puap, static_cast<unsigned long>(kOwnLap), kOwnUap);
     if (lab(line) != 0) { set_status("page setup refused"); return false; }
@@ -535,10 +730,12 @@ bool setup_radio() {
     if (lab(line) != 0) return false;
     lab("lab dtmhop rxmax 4");
     if (lab("lab dtm tx 19 42 0", nullptr, nullptr, 3000) != 0) { set_status("DTM start failed"); return false; }
+    mod_apply();  // BR modulation index for the whole session (page, FHS, connection)
     return true;
 }
 
 void cleanup_radio() {
+    mod_restore();
     for (const char* l : {"lab page stream 0 0 1 0", "lab dtm off", "lab dtmhop off", "lab page off",
                           "lab dtmtrain cfg 0 1", "lab dtmraw 0 0 0", "lab dtmstats 2", "lab quiet 0"})
         lab(l);
@@ -547,21 +744,27 @@ void cleanup_radio() {
 
 void session_task(void*) {
     s->state = State::Setup;
-    if (s->find) {
-        const bool ok = run_inquiry(s->find_only ? 20 : 30, s->find_only);
-        int pick = -1;
-        for (int i = 0; i < s->nfound && pick < 0; ++i) if (audio_class(s->found[i].cod)) pick = i;
-        if (s->find_only || !ok || pick < 0) {
-            if (ok) set_status(s->nfound ? "found %d device(s), %s" : "no discoverable headphones found (pairing mode?)",
-                               s->nfound, pick < 0 ? "none of them audio" : "see the list above");
+    if (s->kind == Kind::Search || s->kind == Kind::SearchPair) {
+        s->searching = true;
+        const bool search = s->kind == Kind::Search;
+        const bool ok = run_inquiry(search ? 40 : 30, search);
+        s->searching = false;
+        int pick = search ? s->pick.load() : -1;
+        for (int i = 0; !search && i < s->nfound && pick < 0; ++i) if (audio_class(s->found[i].cod)) pick = i;
+        if (!ok || pick < 0 || pick >= s->nfound || s->stop) {
+            if (s->stop) set_status("search stopped");
+            else if (ok && !s->nfound) set_status("no discoverable headphones found (pairing mode?)");
+            else if (ok && search) set_status("found %d device(s): tap yours to pair", s->nfound.load());
+            else if (ok) set_status("found %d device(s), none of them audio", s->nfound.load());
             cleanup_radio();
             s->state = State::Idle;
             task = nullptr;
             vTaskDelete(nullptr);
         }
+        // the saved devices stay as they are until pairing succeeds (BR_A2DP_EV_PAIRED)
         std::memcpy(s->peer, s->found[pick].addr, 6);
-        nvs_put("peer", s->peer, 6);
-        nvs_put("key", nullptr, 0);
+        s->peer_cod = s->found[pick].cod;
+        s->peer_valid = true;
         s->have_key = false;
         s->pair = true;
         set_status("pairing with %02X:%02X:%02X:%02X:%02X:%02X", s->peer[5], s->peer[4], s->peer[3], s->peer[2], s->peer[1],
@@ -599,6 +802,7 @@ void session_task(void*) {
                 s->entries0 = q.entries;
                 s->state = State::Connected;
                 set_status("connected (page %.1f s)", (esp_timer_get_time() - t_start) / 1e6);
+
             } else if (esp_timer_get_time() - t_start > 60 * 1000000LL) {
                 set_status("headphones did not answer the page (60 s): on? in range? another device connected?");
                 break;
@@ -685,6 +889,11 @@ void session_task(void*) {
         --quality_left;
         quality_at = esp_timer_get_time() + 2 * 1000000LL;
     }
+    if (s->detach_reason == 0x0B && !user_stop && stale_left > 0) {
+        --stale_left;
+        quality_at = esp_timer_get_time() + 12 * 1000000LL;  // reuses the quality retry path (same headphones)
+        set_status("headphones still hold the last link: retrying in 12 s");
+    }
     if (auto_on && !user_stop && lost && was_connected) {  // unexpected loss of a working link: try again
         if (reconnect_left <= 0) reconnect_left = 3;
         reconnect_at = esp_timer_get_time() + 5 * 1000000LL;
@@ -707,22 +916,40 @@ bool parse_hex(const char* t, uint8_t* out, size_t n) {
 }
 
 void ensure_session() {
+    if (!saved_mu) saved_mu = xSemaphoreCreateMutex();
     if (s) return;
     s = static_cast<Session*>(heap_caps_calloc(1, sizeof(Session), MALLOC_CAP_SPIRAM));
     new (s) Session();
 }
 
-bool start(bool pair, bool beep, bool find = false, bool find_only = false) {
+// addr: the device for Connect (nullptr = the default, saved[0]) and Pair.
+bool start(Kind kind, const uint8_t* addr, bool beep = false) {
     ensure_session();
     if (task) { std::printf("A2DP busy (%s)\n", s->status); return false; }
-    s->find = find;
-    s->find_only = find_only;
-    if (!find && !nvs_get("peer", s->peer, 6)) { set_status("no headphones set: pair first"); return false; }
-    s->have_key = nvs_get("key", s->key, 16);
-    s->pair = pair;
+    s->kind = kind;
+    s->pair = kind != Kind::Connect;
+    s->have_key = false;
+    if (kind == Kind::Connect) {
+        SavedLock l;
+        const int i = addr ? saved_find(addr) : saved_n ? 0 : -1;
+        if (i < 0) { set_status(saved_n ? "those headphones are not saved: pair them" : "no headphones saved: search and pair first"); return false; }
+        std::memcpy(s->peer, saved_list[i].addr, 6);
+        std::memcpy(s->key, saved_list[i].key, 16);
+        s->have_key = saved_list[i].has_key;
+        s->peer_cod = saved_list[i].cod;
+        s->peer_valid = true;
+    } else if (kind == Kind::Pair) {
+        if (!addr) return false;
+        std::memcpy(s->peer, addr, 6);
+        s->peer_cod = 0;
+        for (int i = 0; i < s->nfound; ++i)
+            if (!std::memcmp(s->found[i].addr, addr, 6)) s->peer_cod = s->found[i].cod;
+        s->peer_valid = true;
+    }
     s->beep = beep;
     s->stop = false;
     s->connected = false;
+    s->detach_reason = 0;
     s->log_seen = 0;
     s->enc_mode = 0;
     if (!ring) {
@@ -732,7 +959,7 @@ bool start(bool pair, bool beep, bool find = false, bool find_only = false) {
     ring_w = 0;
     ring_r = 0;
     user_stop = false;
-    if (!quality_start.exchange(false)) { quality_left = kQualityRetries; quality_at = 0; }
+    if (!quality_start.exchange(false)) { quality_left = kQualityRetries; quality_at = 0; stale_left = 2; }
     xTaskCreatePinnedToCore(session_task, "a2dp_native", 8192, nullptr, 6, &task, 1);
     return true;
 }
@@ -744,55 +971,136 @@ void supervisor_task(void*) {
             quality_at = 0;
             std::printf("A2DP reconnecting for link quality (%d tries left)\n", quality_left.load());
             quality_start = true;
-            if (!start(false, false)) quality_start = false;
+            if (!start(Kind::Connect, s->peer_valid ? s->peer : nullptr)) quality_start = false;
             continue;
         }
         if (!auto_on || user_stop || task || reconnect_left <= 0 || esp_timer_get_time() < reconnect_at) continue;
         --reconnect_left;
         std::printf("A2DP auto-reconnect (%d left)\n", reconnect_left.load());
-        if (!start(false, false)) reconnect_left = 0;
+        // after a link loss: the same headphones; after boot: the default
+        if (!start(Kind::Connect, s->peer_valid ? s->peer : nullptr)) reconnect_left = 0;
         reconnect_at = esp_timer_get_time() + 15 * 1000000LL;
     }
 }
 
 }  // namespace
 
-size_t devices(Device* out, size_t capacity) {
-    if (!out) return 0;
-    portENTER_CRITICAL(&discovery_mux);
-    const size_t count = std::min(capacity, discovered_count);
-    std::memcpy(out, discovered, count * sizeof(Device));
-    portEXIT_CRITICAL(&discovery_mux);
-    return count;
+const char* device_kind(uint32_t cod) {
+    if (!cod) return "AUDIO DEVICE";  // saved before classes were kept
+    const unsigned major = (cod >> 8) & 0x1Fu, minor = (cod >> 2) & 0x3Fu;
+    if (major == 0x04) {
+        switch (minor) {
+        case 1: return "HEADSET";
+        case 2: return "HANDS-FREE";
+        case 5: return "SPEAKER";
+        case 6: return "HEADPHONES";
+        case 7: return "PORTABLE AUDIO";
+        case 8: return "CAR AUDIO";
+        case 10: return "HI-FI AUDIO";
+        case 15: return "TV";
+        default: return "AUDIO";
+        }
+    }
+    switch (major) {
+    case 0x01: return "COMPUTER";
+    case 0x02: return "PHONE";
+    case 0x05: return "INPUT DEVICE";
+    case 0x07: return "WEARABLE";
+    default: return "OTHER DEVICE";
+    }
 }
 
 Status status() {
     Status st;
-    if (!s) return st;
+    if (!s || !saved_mu) return st;
     st.running = task != nullptr;
     st.streaming = s->state == State::Streaming;
-    if (!cache_valid) {
-        uint8_t key[16];
-        cache_peer = nvs_get("peer", cache_peer_addr, 6);
-        cache_key = nvs_get("key", key, 16);
-        cache_valid = true;
-    }
-    const uint8_t* peer = cache_peer_addr;
-    st.have_peer = cache_peer;
-    st.have_key = cache_key;
+    st.searching = st.running && s->searching;
     st.auto_reconnect = auto_on;
     st.tone_hz = tone_hz;
     std::snprintf(st.text, sizeof st.text, "%s", s->status);
-    if (st.have_peer)
-        std::snprintf(st.peer, sizeof st.peer, "%02X:%02X:%02X:%02X:%02X:%02X", peer[5], peer[4], peer[3], peer[2], peer[1], peer[0]);
+    if (st.running && s->peer_valid && !s->searching) fmt_addr(st.active, sizeof st.active, s->peer);
+    {
+        SavedLock l;
+        st.saved_count = saved_n;
+        for (int i = 0; i < saved_n; ++i) {
+            Device& d = st.saved[i];
+            fmt_addr(d.addr, sizeof d.addr, saved_list[i].addr);
+            std::snprintf(d.name, sizeof d.name, "%s", saved_list[i].name);
+            d.cod = saved_list[i].cod;
+            d.paired = saved_list[i].has_key;
+            d.saved = true;
+        }
+        st.have_peer = saved_n > 0;
+        st.have_key = saved_n > 0 && saved_list[0].has_key;
+        if (saved_n) fmt_addr(st.peer, sizeof st.peer, saved_list[0].addr);
+        // last search: audio devices first, then the rest, each in the order found
+        const int nf = s->nfound;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < nf; ++i) {
+                const Found& f = s->found[i];
+                if (audio_class(f.cod) != (pass == 0)) continue;
+                Device& d = st.found[st.found_count++];
+                fmt_addr(d.addr, sizeof d.addr, f.addr);
+                d.cod = f.cod;
+                d.supported = pageable(fhs_len_for(f.addr));
+                const int k = saved_find(f.addr);
+                d.saved = k >= 0;
+                d.paired = k >= 0 && saved_list[k].has_key;
+                if (k >= 0) std::snprintf(d.name, sizeof d.name, "%s", saved_list[k].name);
+            }
+        }
+    }
     return st;
 }
 
-void connect(bool pair) { start(pair, false, pair, false); }  // pairing = find the headphones in pairing mode first
+void connect(bool pair) {
+    if (!pair) { start(Kind::Connect, nullptr); return; }
+    start(Kind::SearchPair, nullptr);  // find the first headphones in pairing mode and pair them
+}
+
+bool search() { return start(Kind::Search, nullptr); }
+
+bool pair_found(const char* addr) {
+    uint8_t a[6];
+    if (!parse_addr(addr, a)) return false;
+    ensure_session();
+    if (task) {
+        if (!s->searching) return false;
+        for (int i = 0; i < s->nfound; ++i)
+            if (!std::memcmp(s->found[i].addr, a, 6)) {
+                s->pick = i;
+                set_status("finishing the search window, then pairing with %s", addr);
+                return true;
+            }
+        return false;
+    }
+    return start(Kind::Pair, a);
+}
+
+bool connect_saved(const char* addr) {
+    uint8_t a[6];
+    return parse_addr(addr, a) && start(Kind::Connect, a);
+}
+
+void forget_saved(const char* addr) {
+    uint8_t a[6];
+    if (!parse_addr(addr, a)) return;
+    ensure_session();
+    if (task && s->peer_valid && !std::memcmp(s->peer, a, 6)) disconnect();
+    SavedLock l;
+    const int i = saved_find(a);
+    if (i < 0) return;
+    std::memmove(saved_list + i, saved_list + i + 1, (saved_n - i - 1) * sizeof(Saved));
+    --saved_n;
+    saved_store();
+    std::printf("A2DP forgot %s\n", addr);
+}
 
 void disconnect() {
     user_stop = true;
     reconnect_left = 0;
+    quality_at = 0;
     if (task && s) s->stop = true;
 }
 
@@ -804,6 +1112,7 @@ void set_auto(bool on) {
 
 void init() {
     ensure_session();
+    saved_load();
     uint8_t v = 0;
     auto_on = nvs_get("auto", &v, 1) && v;
     if (auto_on) {  // one attempt after boot, once the C6 link is up
@@ -846,19 +1155,54 @@ void command(const char* line) {
     char* tok[6] = {};
     int n = 0;
     for (char* t = std::strtok(buf, " \t"); t && n < 6; t = std::strtok(nullptr, " \t")) tok[n++] = t;
-    if (n < 2) { std::printf("A2DP usage: a2dp find | pair | connect [pair] [beep] | stop | status | auto <0|1> | peer <hex> | key <hex|clear> | tone <Hz|off>\n"); return; }
+    if (n < 2) { std::printf("A2DP usage: a2dp find | list | pair [<n found> | <addr>] | connect [<n saved>] [pair] [beep] | forget <n saved> | stop | status | auto <0|1> | peer <hex> | key <hex|clear> | tone <Hz|off>\n"); return; }
     const char* c = tok[1];
     if (!std::strcmp(c, "connect")) {
         bool pair = false, beep = false;
+        int idx = 0;
         for (int i = 2; i < n; ++i) {
             if (!std::strcmp(tok[i], "pair")) pair = true;
-            if (!std::strcmp(tok[i], "beep")) beep = true;
+            else if (!std::strcmp(tok[i], "beep")) beep = true;
+            else idx = std::atoi(tok[i]);
         }
-        start(pair, beep);
+        uint8_t a[6];
+        {
+            SavedLock l;
+            if (idx < 0 || idx >= saved_n) { std::printf("A2DP no saved device %d (a2dp list)\n", idx); return; }
+            std::memcpy(a, saved_list[idx].addr, 6);
+        }
+        start(pair ? Kind::Pair : Kind::Connect, a, beep);
         return;
     }
-    if (!std::strcmp(c, "find")) { start(false, false, true, true); return; }
-    if (!std::strcmp(c, "pair")) { start(true, false, true, false); return; }
+    if (!std::strcmp(c, "find") || !std::strcmp(c, "search")) { search(); return; }
+    if (!std::strcmp(c, "pair") && n == 2) { start(Kind::SearchPair, nullptr); return; }
+    if ((!std::strcmp(c, "pair") || !std::strcmp(c, "forget")) && n >= 3) {
+        static Status st;  // ~2 KB: off the console task's stack
+        st = status();
+        const bool pair = !std::strcmp(c, "pair");
+        const int count = pair ? st.found_count : st.saved_count;
+        const Device* list = pair ? st.found : st.saved;
+        const bool index = std::strlen(tok[2]) <= 2;
+        const char* addr = index ? (std::atoi(tok[2]) >= 0 && std::atoi(tok[2]) < count ? list[std::atoi(tok[2])].addr : nullptr) : tok[2];
+        if (!addr) { std::printf("A2DP no %s device %s (a2dp list)\n", pair ? "found" : "saved", tok[2]); return; }
+        if (pair) std::printf("A2DP pair %s: %s\n", addr, pair_found(addr) ? "started" : "refused (busy or bad address)");
+        else forget_saved(addr);
+        return;
+    }
+    if (!std::strcmp(c, "list")) {
+        static Status st;
+        st = status();
+        std::printf("A2DP saved (%d, most recent first):\n", st.saved_count);
+        for (int i = 0; i < st.saved_count; ++i)
+            std::printf("  %d  %s  %-14s %s%s\n", i, st.saved[i].addr, device_kind(st.saved[i].cod), st.saved[i].name,
+                        st.saved[i].paired ? "" : " (no key)");
+        std::printf("A2DP found in the last search (%d):\n", st.found_count);
+        for (int i = 0; i < st.found_count; ++i)
+            std::printf("  %d  %s  %06lX %s%s%s\n", i, st.found[i].addr, static_cast<unsigned long>(st.found[i].cod),
+                        device_kind(st.found[i].cod), st.found[i].saved ? " (saved)" : "",
+                        st.found[i].supported ? "" : " (not supported yet: long FHS)");
+        return;
+    }
     if (!std::strcmp(c, "auto") && n == 3) { set_auto(std::atoi(tok[2]) != 0); std::printf("A2DP auto-reconnect %d\n", auto_on.load()); return; }
     if (!std::strcmp(c, "stop")) {
         if (task) std::printf("A2DP stopping\n");
@@ -867,13 +1211,11 @@ void command(const char* line) {
         return;
     }
     if (!std::strcmp(c, "status")) {
-        uint8_t peer[6];
-        const bool hp = nvs_get("peer", peer, 6);
-        uint8_t k[16];
-        const bool hk = nvs_get("key", k, 16);
-        std::printf("A2DP %s | peer %s%02X:%02X:%02X:%02X:%02X:%02X | key %s | tone %d Hz | pcm in %lu (peak %lu) "
-                    "| sbc frames %lu | bitpool %d\n", s->status, hp ? "" : "(none) ", peer[5], peer[4], peer[3], peer[2], peer[1],
-                    peer[0], hk ? "stored" : "none", tone_hz, static_cast<unsigned long>(pcm_in.load()),
+        static Status st;
+        st = status();
+        std::printf("A2DP %s | default %s | key %s | %d saved | tone %d Hz | pcm in %lu (peak %lu) "
+                    "| sbc frames %lu | bitpool %d\n", s->status, st.have_peer ? st.peer : "(none)",
+                    st.have_key ? "stored" : "none", st.saved_count, tone_hz, static_cast<unsigned long>(pcm_in.load()),
                     static_cast<unsigned long>(pcm_peak.load()), static_cast<unsigned long>(frames_out.load()),
                     stream_bitpool.load());
         return;
@@ -882,18 +1224,26 @@ void command(const char* line) {
         uint8_t be[6], le[6];
         if (!parse_hex(tok[2], be, 6)) { std::printf("A2DP peer: 12 hex digits, MSB first (e.g. AABBCCDDEEFF)\n"); return; }
         for (int i = 0; i < 6; ++i) le[i] = be[5 - i];
-        nvs_put("peer", le, 6);
-        nvs_put("key", nullptr, 0);  // a new peer needs pairing
-        std::printf("A2DP peer set; pair with: a2dp connect pair\n");
+        saved_upsert(le, nullptr, 0, nullptr);
+        std::printf("A2DP peer saved as the default; pair with: a2dp connect pair\n");
         return;
     }
     if (!std::strcmp(c, "key") && n == 3) {
-        if (!std::strcmp(tok[2], "clear")) { nvs_put("key", nullptr, 0); std::printf("A2DP key cleared\n"); return; }
-        uint8_t be[16], le[16];
+        SavedLock l;
+        if (!saved_n) { std::printf("A2DP no saved device: a2dp peer <hex> first\n"); return; }
+        if (!std::strcmp(tok[2], "clear")) {
+            saved_list[0].has_key = 0;
+            std::memset(saved_list[0].key, 0, 16);
+            saved_store();
+            std::printf("A2DP key cleared (default device)\n");
+            return;
+        }
+        uint8_t be[16];
         if (!parse_hex(tok[2], be, 16)) { std::printf("A2DP key: 32 hex digits, MSB first\n"); return; }
-        for (int i = 0; i < 16; ++i) le[i] = be[15 - i];
-        nvs_put("key", le, 16);
-        std::printf("A2DP key stored\n");
+        for (int i = 0; i < 16; ++i) saved_list[0].key[i] = be[15 - i];
+        saved_list[0].has_key = 1;
+        saved_store();
+        std::printf("A2DP key stored (default device)\n");
         return;
     }
     if (!std::strcmp(c, "qmax") && n == 3) {
@@ -909,6 +1259,79 @@ void command(const char* line) {
     if (!std::strcmp(c, "connls44") && n == 3) {
         conn_ls44 = std::max(400, std::min(1100, std::atoi(tok[2])));
         std::printf("A2DP connection RX window ls44 %d (next connect)\n", conn_ls44);
+        return;
+    }
+    if (!std::strcmp(c, "brmod") && n == 3) {
+        br_filt = static_cast<uint32_t>(std::strtoul(tok[2], nullptr, 16)) & 0xFFu;
+        std::printf("A2DP BR modulation filter byte %02lX (next connect; 0 = BLE h 0.5)\n", static_cast<unsigned long>(br_filt));
+        return;
+    }
+    if (!std::strcmp(c, "brtrim") && n == 3) {
+        br_trim = static_cast<uint32_t>(std::atoi(tok[2])) & 0xFu;
+        std::printf("A2DP BR modulation trim %lu (next connect)\n", static_cast<unsigned long>(br_trim));
+        return;
+    }
+    if (!std::strcmp(c, "frag") && n == 3) {
+        l2_frag = std::max(0, std::min(27, std::atoi(tok[2])));
+        std::printf("A2DP media DH1 fragments %d bytes (next stream)\n", l2_frag ? l2_frag : 27);
+        return;
+    }
+    if (!std::strcmp(c, "txpwr") && n == 3) {
+        tx_dbm = std::atoi(tok[2]);
+        std::printf("A2DP TX power %d dBm (next connect)\n", tx_dbm);
+        return;
+    }
+    if (!std::strcmp(c, "dm1") && n == 3) {
+        l2_dm1 = std::atoi(tok[2]) != 0;
+        std::printf("A2DP L2CAP in %s (next packets)\n", l2_dm1 ? "DM1 (FEC 2/3, 17 bytes)" : "DH1 (27 bytes)");
+        return;
+    }
+    if (!std::strcmp(c, "diag")) {  // link counters since the connection started (C6 FIFO + scheduler)
+        uint8_t b[240];
+        size_t bn = sizeof b;
+        if (lab("lab page connq", b, &bn) != 0 || bn < 165) { std::printf("A2DP diag: no connq\n"); return; }
+        auto u32 = [&](size_t o) { return static_cast<unsigned long>(b[o] | b[o + 1] << 8 | b[o + 2] << 16 | static_cast<uint32_t>(b[o + 3]) << 24); };
+        std::printf("A2DP diag: tx %lu noreply %lu hecfail %lu | fifo tx %lu retx %lu acked %lu | rx nak %lu ack %lu dup %lu"
+                    " verified %lu verify_fail %lu\n", u32(14), u32(93 + 48), u32(93 + 32), u32(93 + 8), u32(93 + 12),
+                    u32(93 + 16), u32(93 + 24), u32(93 + 28), u32(93 + 44), u32(93 + 36), u32(93 + 40));
+        bn = sizeof b;
+        if (lab("lab page chanq", b, &bn) == 0 && bn >= 234) {
+            std::printf("A2DP diag: replies to our data %lu: ARQN=1 %lu, FLOW=stop %lu, types", u32(158), u32(162), u32(166));
+            for (int i = 0; i < 16; ++i) if (u32(170 + 4 * i)) std::printf(" %d:%lu", i, u32(170 + 4 * i));
+            std::printf("\n");
+        }
+        bn = sizeof b;
+        if (lab("lab page diag", b, &bn) == 0 && bn >= 213) {
+            std::printf("A2DP diag: late skips %lu | hook latency after TX (100 us bins):", u32(209));
+            for (int i = 0; i < 16; ++i) std::printf(" %lu", u32(4 * i));
+            std::printf(" | after RX:");
+            for (int i = 0; i < 16; ++i) std::printf(" %lu", u32(64 + 4 * i));
+            std::printf("\n");
+        }
+        return;
+    }
+    if (!std::strcmp(c, "chans")) {  // per-channel missed replies of the links so far (C6 1.4.254; "chans 0" resets)
+        if (n == 3) { lab("lab page chanq 0"); std::printf("A2DP channel stats reset\n"); return; }
+        uint8_t b[200];
+        size_t bn = sizeof b;
+        if (lab("lab page chanq", b, &bn) != 0 || bn < 158) { std::printf("A2DP chans: needs C6 1.4.254\n"); return; }
+        for (int half = 0; half < 2; ++half) {
+            std::printf("A2DP missed %% by %s channel (2402+ch MHz, -- = unused):\n", half ? "reply" : "our TX");
+            for (int row = 0; row < 79; row += 20) {
+                char line[160];
+                int o = std::snprintf(line, sizeof line, "A2DP  %2d:", row);
+                for (int ch = row; ch < row + 20 && ch < 79; ++ch) {
+                    const uint8_t v = b[half * 79 + ch];
+                    o += v == 255 ? std::snprintf(line + o, sizeof line - o, "  --") : std::snprintf(line + o, sizeof line - o, " %3u", v);
+                }
+                std::printf("%s\n", line);
+            }
+        }
+        return;
+    }
+    if (!std::strcmp(c, "shift") && n == 3) {
+        use_shift = std::atoi(tok[2]) != 0;
+        std::printf("A2DP shifted FHS %s (next connect)\n", use_shift ? "on (C6 1.4.253+)" : "off");
         return;
     }
     if (!std::strcmp(c, "rxearly") && n == 3) {

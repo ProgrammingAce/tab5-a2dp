@@ -25,7 +25,9 @@ enum {
     BR_A2DP_EV_STREAMING = 3,  /* arg: const br_a2dp_stream_t* */
     BR_A2DP_EV_FAILED = 4,     /* arg: const char* reason */
     BR_A2DP_EV_DETACHED = 5,   /* arg: const uint8_t* reason code */
-    BR_A2DP_EV_SUSPENDED = 6,  /* arg: NULL (the sink suspended or closed the stream) */
+    BR_A2DP_EV_SUSPENDED = 6,  /* arg: NULL (the sink suspended or closed the stream; after a suspend the engine
+                                * sends START again and reports BR_A2DP_EV_STREAMING once more) */
+    BR_A2DP_EV_NAME = 7,       /* arg: const char* (the sink's user-friendly name, UTF-8, read after encryption) */
 };
 
 typedef struct {
@@ -63,6 +65,7 @@ typedef struct {
 } br_a2dp_cfg_t;
 
 #define BR_A2DP_L2CAP_BUF 1024
+#define BR_A2DP_NAME_MAX 48 /* longer names are cut */
 
 typedef struct {
     uint16_t scid, dcid, peer_mtu;
@@ -86,13 +89,22 @@ typedef struct br_a2dp {
     uint8_t ident;
     uint8_t rx[BR_A2DP_L2CAP_BUF];
     uint16_t rx_len;
-    br_a2dp_ch_t sig, media;
+    br_a2dp_ch_t sig, media, sdp; /* sdp: incoming SDP channel (sinks look up our A2DP Source record first) */
     uint8_t l2_state;
     uint32_t t_l2_start, t_sig_up, t_need_media;
     /* AVDTP */
     uint8_t label, av_state, sink_seid, peer_int, have_config;
     uint8_t config_ie[6];
     br_a2dp_stream_t stream;
+    /* sink endpoints from discover (audio sinks not in use), tried in order until one offers SBC */
+    uint8_t sep_cand[8], sep_n, sep_i;
+    /* the sink suspended the stream: restart it ourselves (resume_at ms; resuming = our START is out) */
+    uint8_t resuming;
+    uint32_t resume_at;
+    uint8_t key_size; /* negotiated encryption key size (16 unless the sink proposes 7..15) */
+    /* remote name (LMP_name_req after encryption; 14-byte fragments) */
+    uint8_t name_state, name_len;
+    char peer_name[BR_A2DP_NAME_MAX + 1];
 } br_a2dp_t;
 
 void br_a2dp_init(br_a2dp_t* a, const br_a2dp_cfg_t* cfg, const br_a2dp_io_t* io);

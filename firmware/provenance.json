@@ -1,11 +1,12 @@
 {
-  "c6_version": "1.4.252",
-  "c6_image_sha256": "c9f14421677771f1e9724e7045bbb266b88649b1734498c81f170ea2111b6b33",
-  "c6_image_origin": "parent tab5 repo main/bt/c6/network_adapter.bin, built by tools/br_lab/session224/c6_release.sh from c6_fw 70b638b + the 1.4.247-1.4.252 radio_lab.c changes included in this repo (c6_fw/c6_firmware/main/radio_lab.c is identical); installed and confirmed on hardware 2026-11-10",
-  "c6_rebuild_check": "this repo's c6_fw source rebuilt with sdkconfig.release: verify_hooks RESULT: PASS, version string 1.4.252 (image hash differs by build metadata)",
-  "p4_source": "this repository (demo), commit 7bfdcb7 plus the adaptive-bitpool update; parent tab5 base 75a76e7",
-  "p4_build": "clean build, idf.py -DIDF_TARGET=esp32p4 build + idf.py merge-bin",
-  "p4_app_sha256": "3b41ea9f33eb9ec745503ac32458d25d105eb599e204c5e9e7794448d8edaec9",
-  "p4_merged_sha256": "ec6421edc385bab702afc26dc7cb99b020f2748ee3c479b0c465d90bbc1c0868",
+  "c6_version": "1.4.264",
+  "c6_image_sha256": "f5d6df90191fb2d25333d8c3b418db1386de7f28aca02e53939a5d9d8d1ec732",
+  "c6_image_origin": "parent tab5 working tree main/bt/c6/network_adapter.bin, built by tools/br_lab/session224/c6_release.sh from c6_fw 70b638b plus the uncommitted 1.4.247-1.4.264 radio_lab.c changes included in this repo (c6_fw/c6_firmware/main/radio_lab.c and radio_lab.h are identical); installed and confirmed on hardware 2026-11-11",
+  "c6_rebuild_check": "this repo's c6_fw source rebuilt with sdkconfig.release after reconfigure: verify_hooks RESULT: PASS, version string 1.4.264 (image hash differs by build metadata)",
+  "p4_source": "this repository (demo), commit 62ebca9 plus the 2026-11-11 update; host/baseband/radio_lab sources identical to the parent tab5 working tree of 2026-11-11 (parent base commit 75a76e7, changes uncommitted there)",
+  "p4_build": "clean build (idf.py fullclean), then a rebuild after a help-text change; idf.py -DIDF_TARGET=esp32p4 build + idf.py merge-bin",
+  "p4_app_sha256": "9298fbb678c864a9c7a1815aa6e3538b3af1fa06c37166b70946e4e04b43fb2f",
+  "p4_merged_sha256": "a30681507405f21806543b9e9629a922a1767de97cfd72e04da634d1189d41f9",
+  "p4_hardware_test": "not flashed; the same host code was run in the parent firmware (HDB 630, 92 % of audio fragments acknowledged)",
   "idf_version": "5.5.5"
 }

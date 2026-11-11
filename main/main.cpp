@@ -13,12 +13,11 @@
 
 static void help() {
     std::puts("\nTab5 native Bluetooth Classic / A2DP demo\n"
-              "Put headphones in pairing mode, then: a2dp pair\n"
-              "After streaming starts: a2dp tone 440\n"
-              "a2dp tone off | a2dp status | a2dp stop\n"
-              "Reconnect a bonded device: a2dp connect\n"
-              "Select explicitly: a2dp peer AABBCCDDEEFF, then a2dp connect pair\n"
-              "Discovery: a2dp find | Boot reconnect: a2dp auto 1\n"
+              "Put headphones in pairing mode, then: a2dp find, a2dp list, a2dp pair <n | address>\n"
+              "(or a2dp pair: pair the first audio device found)\n"
+              "After streaming starts: a2dp tone 440 | a2dp tone off | a2dp status | a2dp stop\n"
+              "Saved headphones: a2dp list | a2dp connect [n] | a2dp forget <n> | Boot reconnect: a2dp auto 1\n"
+              "Diagnostics: a2dp diag | a2dp chans | BR modulation: a2dp brmod <hex|0>\n"
               "Stop the link before resetting or flashing. Type help to repeat.");
 }
 

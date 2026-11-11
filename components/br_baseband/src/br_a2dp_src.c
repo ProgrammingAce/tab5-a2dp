@@ -49,6 +49,8 @@ enum { AV_IDLE, AV_DISCOVER, AV_CAPS, AV_CONFIGURE, AV_OPEN, AV_CONFIGURED, AV_N
 #define PSM_AVDTP 0x0019
 #define SIG_SCID 0x0041
 #define MEDIA_SCID 0x0042
+#define SDP_SCID 0x0043
+#define PSM_SDP 0x0001
 #define OUR_MTU 672
 #define INT_SEID 1
 
@@ -98,8 +100,8 @@ static void lmp_reject(br_a2dp_t* a, uint8_t tid, uint8_t op, uint8_t err)
 /* ---- L2CAP output ----------------------------------------------------------------------------------------------- */
 static void l2_send(br_a2dp_t* a, uint16_t cid, const uint8_t* p, size_t n)
 {
-    uint8_t f[4 + 64];
-    if (n > 64) return;
+    uint8_t f[4 + 256];
+    if (n > 256) return;
     f[0] = (uint8_t)n; f[1] = (uint8_t)(n >> 8); f[2] = (uint8_t)cid; f[3] = (uint8_t)(cid >> 8);
     memcpy(f + 4, p, n);
     a->io.send(a->io.ctx, 2, f, 4 + n);
@@ -138,7 +140,178 @@ static br_a2dp_ch_t* ch_by_scid(br_a2dp_t* a, uint16_t scid)
 {
     if (a->sig.used && a->sig.scid == scid) return &a->sig;
     if (a->media.used && a->media.scid == scid) return &a->media;
+    if (a->sdp.used && a->sdp.scid == scid) return &a->sdp;
     return NULL;
+}
+
+/* ---- SDP server (Core Vol 3 Part B): one record, A2DP Source (A2DP 1.3 §5.3, mandatory for a SRC) --------------- */
+/* Attributes in ascending ID order: {id, encoded value}. Big-endian data elements. */
+static const uint8_t kSdpRecord[] = {
+    0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01,                          /* ServiceRecordHandle 0x00010001 */
+    0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0A,                          /* ServiceClassIDList: AudioSource */
+    0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x19, /* ProtocolDescriptorList: L2CAP 0x19 */
+    0x35, 0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03,                          /*   AVDTP 1.3 */
+    0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,                          /* BrowseGroupList: PublicBrowseRoot */
+    0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09, 0x01, 0x03, /* ProfileDescriptorList: A2DP 1.3 */
+    0x09, 0x01, 0x00, 0x25, 0x04, 'T', 'a', 'b', '5',                        /* ServiceName */
+    0x09, 0x03, 0x11, 0x09, 0x00, 0x01,                                      /* SupportedFeatures: player */
+};
+#define SDP_HANDLE 0x00010001u
+static const uint16_t kSdpUuids[] = {0x110A, 0x0100, 0x0019, 0x1002, 0x110D};
+
+static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
+/* Data element header at p: returns the header length and sets *type and *len (0 = malformed). */
+static size_t sdp_de(const uint8_t* p, size_t n, uint8_t* type, size_t* len)
+{
+    if (!n) return 0;
+    *type = p[0] >> 3;
+    const uint8_t sz = p[0] & 7u;
+    if (*type == 0) { *len = 0; return 1; }
+    if (sz < 5) { *len = (size_t)1 << sz; return 1; }
+    const size_t hb = sz == 5 ? 1 : sz == 6 ? 2 : 4;
+    if (n < 1 + hb) return 0;
+    *len = sz == 5 ? p[1] : sz == 6 ? be16(p + 1) : be32(p + 1);
+    return 1 + hb;
+}
+/* Sequence at p: calls fn for each element (pointer to its header, total size). Returns bytes used, 0 = malformed. */
+static size_t sdp_seq(const uint8_t* p, size_t n, const uint8_t** body, size_t* body_len)
+{
+    uint8_t type; size_t len;
+    const size_t h = sdp_de(p, n, &type, &len);
+    if (!h || type != 6 || h + len > n) return 0;
+    *body = p + h; *body_len = len;
+    return h + len;
+}
+/* Every UUID of the search pattern must be in the record (16/32-bit, or 128-bit on the Base UUID). */
+static int sdp_match(const uint8_t* pat, size_t n)
+{
+    static const uint8_t base[12] = {0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB};
+    for (size_t i = 0; i < n;) {
+        uint8_t type; size_t len;
+        const size_t h = sdp_de(pat + i, n - i, &type, &len);
+        if (!h || type != 3 || i + h + len > n) return 0;
+        const uint8_t* u = pat + i + h;
+        uint32_t v;
+        if (len == 2) v = be16(u);
+        else if (len == 4) v = be32(u);
+        else if (len == 16 && !memcmp(u + 4, base, 12)) v = be32(u);
+        else return 0;
+        int found = 0;
+        for (size_t k = 0; k < sizeof kSdpUuids / sizeof kSdpUuids[0]; ++k) found |= v == kSdpUuids[k];
+        if (!found) return 0;
+        i += h + len;
+    }
+    return 1;
+}
+/* The record's attributes selected by an AttributeIDList, as one data element sequence. */
+static size_t sdp_attrs(const uint8_t* ids, size_t n, uint8_t* out, size_t cap)
+{
+    uint8_t body[sizeof kSdpRecord];
+    size_t bl = 0;
+    for (size_t r = 0; r < sizeof kSdpRecord;) {
+        const uint16_t id = be16(kSdpRecord + r + 1);
+        uint8_t type; size_t len;
+        const size_t h = sdp_de(kSdpRecord + r + 3, sizeof kSdpRecord - r - 3, &type, &len);
+        const size_t sz = 3 + h + len;
+        int want = 0;
+        for (size_t i = 0; i < n;) {
+            uint8_t it; size_t il;
+            const size_t ih = sdp_de(ids + i, n - i, &it, &il);
+            if (!ih || it != 1 || i + ih + il > n) break;
+            if (il == 2) want |= be16(ids + i + ih) == id;
+            else if (il == 4) want |= be16(ids + i + ih) <= id && id <= be16(ids + i + ih + 2);
+            i += ih + il;
+        }
+        if (want) { memcpy(body + bl, kSdpRecord + r, sz); bl += sz; }
+        r += sz;
+    }
+    if (bl + 2 > cap) return 0;
+    out[0] = 0x35; out[1] = (uint8_t)bl;
+    memcpy(out + 2, body, bl);
+    return bl + 2;
+}
+static void sdp_send(br_a2dp_t* a, uint8_t pdu, uint16_t tid, const uint8_t* p, size_t n)
+{
+    uint8_t b[5 + 200];
+    if (n > 200) return;
+    b[0] = pdu; b[1] = (uint8_t)(tid >> 8); b[2] = (uint8_t)tid; b[3] = (uint8_t)(n >> 8); b[4] = (uint8_t)n;
+    memcpy(b + 5, p, n);
+    l2_send(a, a->sdp.dcid, b, 5 + n);
+}
+static void sdp_error(br_a2dp_t* a, uint16_t tid, uint16_t code)
+{
+    const uint8_t e[2] = {(uint8_t)(code >> 8), (uint8_t)code};
+    sdp_send(a, 0x01, tid, e, 2);
+}
+/* Attribute byte stream `full` cut at the sink's maximum byte count; continuation state = 2-byte offset. */
+static void sdp_attr_response(br_a2dp_t* a, uint8_t pdu, uint16_t tid, const uint8_t* full, size_t fl, uint16_t max,
+                              const uint8_t* cont, size_t cn)
+{
+    size_t off = 0;
+    if (cn >= 1 && cont[0] == 2 && cn >= 3) off = be16(cont + 1);
+    else if (cn >= 1 && cont[0] != 0) { sdp_error(a, tid, 0x0005); return; }
+    if (off > fl) { sdp_error(a, tid, 0x0005); return; }
+    if (max < 7) max = 7;
+    if (max > 160) max = 160;
+    const size_t take = fl - off < max ? fl - off : max;
+    uint8_t r[2 + 160 + 3];
+    r[0] = (uint8_t)(take >> 8); r[1] = (uint8_t)take;
+    memcpy(r + 2, full + off, take);
+    size_t rn = 2 + take;
+    if (off + take < fl) { r[rn++] = 2; r[rn++] = (uint8_t)((off + take) >> 8); r[rn++] = (uint8_t)(off + take); }
+    else r[rn++] = 0;
+    sdp_send(a, pdu, tid, r, rn);
+}
+static void sdp_on(br_a2dp_t* a, const uint8_t* m, size_t n)
+{
+    if (n < 5) return;
+    const uint8_t pdu = m[0];
+    const uint16_t tid = be16(m + 1), plen = be16(m + 3);
+    const uint8_t* p = m + 5;
+    if ((size_t)plen + 5 > n) { sdp_error(a, tid, 0x0004); return; }
+    const uint8_t *pat = NULL, *ids = NULL;
+    size_t pl = 0, il = 0, used = 0, u;
+    switch (pdu) {
+    case 0x02: { /* ServiceSearchRequest: pattern, max count, continuation */
+        if (!(used = sdp_seq(p, plen, &pat, &pl)) || used + 3 > plen) { sdp_error(a, tid, 0x0003); return; }
+        const int hit = sdp_match(pat, pl) && be16(p + used) > 0;
+        uint8_t r[2 + 2 + 4 + 1] = {0, (uint8_t)hit, 0, (uint8_t)hit};
+        size_t rn = 4;
+        if (hit) { r[4] = SDP_HANDLE >> 24; r[5] = (uint8_t)(SDP_HANDLE >> 16); r[6] = (uint8_t)(SDP_HANDLE >> 8); r[7] = (uint8_t)SDP_HANDLE; rn = 8; }
+        r[rn++] = 0;
+        sdp_send(a, 0x03, tid, r, rn);
+        a2_log(a, "SDP: service search -> %d record(s)", hit);
+        return;
+    }
+    case 0x04: { /* ServiceAttributeRequest: handle, max bytes, attribute IDs, continuation */
+        if (plen < 6) { sdp_error(a, tid, 0x0003); return; }
+        if (be32(p) != SDP_HANDLE) { sdp_error(a, tid, 0x0002); return; }
+        if (!(u = sdp_seq(p + 6, plen - 6u, &ids, &il))) { sdp_error(a, tid, 0x0003); return; }
+        uint8_t full[2 + sizeof kSdpRecord];
+        const size_t fl = sdp_attrs(ids, il, full, sizeof full);
+        sdp_attr_response(a, 0x05, tid, full, fl, be16(p + 4), p + 6 + u, plen - 6u - u);
+        a2_log(a, "SDP: attributes of our record (%u bytes)", (unsigned)fl);
+        return;
+    }
+    case 0x06: { /* ServiceSearchAttributeRequest: pattern, max bytes, attribute IDs, continuation */
+        if (!(used = sdp_seq(p, plen, &pat, &pl)) || used + 2 > plen) { sdp_error(a, tid, 0x0003); return; }
+        const uint16_t max = be16(p + used);
+        if (!(u = sdp_seq(p + used + 2, plen - used - 2u, &ids, &il))) { sdp_error(a, tid, 0x0003); return; }
+        uint8_t full[4 + sizeof kSdpRecord];
+        size_t fl = 2;
+        full[0] = 0x35; full[1] = 0;
+        if (sdp_match(pat, pl)) {
+            const size_t al = sdp_attrs(ids, il, full + 2, sizeof full - 2);
+            full[1] = (uint8_t)al;
+            fl += al;
+        }
+        sdp_attr_response(a, 0x07, tid, full, fl, max, p + used + 2 + u, plen - used - 2u - u);
+        a2_log(a, "SDP: search + attributes -> %u bytes", (unsigned)fl);
+        return;
+    }
+    default: sdp_error(a, tid, 0x0003); return;
+    }
 }
 
 /* ---- AVDTP ------------------------------------------------------------------------------------------------------ */
@@ -216,6 +389,7 @@ static void l2_progress(br_a2dp_t* a);
 static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
 {
     if (n < 2) return;
+    if (m[0] & 0x0Cu) { a2_log(a, "AVDTP: fragmented signaling packet ignored"); return; }  /* packet type != single */
     const uint8_t label = m[0] >> 4, msg = m[0] & 3u, signal = m[1] & 0x3Fu;
     const uint8_t* p = m + 2;
     const size_t pn = n - 2;
@@ -273,10 +447,20 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
             av_send(a, label, AV_ACCEPT, signal, NULL, 0);
             if (signal != SIG_SUSPEND) a->have_config = 0;
             a->av_state = signal == SIG_SUSPEND ? AV_CONFIGURED : AV_IDLE;
+            a->resuming = 0;
+            a->resume_at = signal == SIG_SUSPEND ? now(a) + 2000u : 0;  /* a source restarts its stream (AVDTP 8.15) */
             if (a->l2_state == L2_STREAMING) a->l2_state = L2_SIGNALING;
             if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_SUSPENDED, NULL);
             return;
         case SIG_GET_CONFIG:
+            if (a->have_config && pn && (p[0] >> 2) == INT_SEID) {
+                uint8_t c[2 + 2 + 6] = {CAT_TRANSPORT, 0, CAT_CODEC, 6};
+                memcpy(c + 4, a->config_ie, 6);
+                av_send(a, label, AV_ACCEPT, signal, c, sizeof c);
+                return;
+            }
+            { const uint8_t e = 0x12; av_send(a, label, AV_REJECT, signal, &e, 1); }  /* BAD_ACP_SEID */
+            return;
         case SIG_RECONFIG:
         case SIG_SECURITY: { const uint8_t e = 0x31; av_send(a, label, AV_REJECT, signal, &e, 1); return; }
         default: break;
@@ -286,6 +470,19 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
     }
     if (msg != AV_ACCEPT) {
         if (signal == SIG_START && a->av_state == AV_STREAMING) return;
+        if (signal == SIG_START && a->resuming) {  /* still busy (a call, another source): try again later */
+            a->resuming = 0;
+            a->av_state = AV_CONFIGURED;
+            a->l2_state = L2_SIGNALING;
+            a->resume_at = now(a) + 10000u;
+            return;
+        }
+        if (signal == SIG_GET_CAPS && a->av_state == AV_CAPS && a->sep_i + 1u < a->sep_n) {
+            const uint8_t s = (uint8_t)(a->sep_cand[++a->sep_i] << 2);
+            a->sink_seid = a->sep_cand[a->sep_i];
+            av_cmd(a, SIG_GET_CAPS, &s, 1);
+            return;
+        }
         if (a->peer_int && (signal == SIG_DISCOVER || signal == SIG_GET_CAPS || signal == SIG_SET_CONFIG)) return;
         a2_log(a, "AVDTP: signal %u rejected (msg %u)", signal, msg);
         a->av_state = AV_FAIL;
@@ -294,22 +491,32 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
     }
     if (a->peer_int && (signal == SIG_DISCOVER || signal == SIG_GET_CAPS || signal == SIG_GET_ALL_CAPS)) return;
     if (signal == SIG_DISCOVER && a->av_state == AV_DISCOVER) {
-        for (size_t i = 0; i + 1 < pn; i += 2) {
+        /* Sinks often list several endpoints (SBC, AAC, vendor codecs) in any order: try each audio sink. */
+        a->sep_n = 0; a->sep_i = 0;
+        for (size_t i = 0; i + 1 < pn && a->sep_n < sizeof a->sep_cand; i += 2) {
             const uint8_t seid = p[i] >> 2, in_use = (p[i] >> 1) & 1u, media = p[i + 1] >> 4, tsep = (p[i + 1] >> 3) & 1u;
-            if (tsep == 1 && media == 0 && !in_use) {
-                a->sink_seid = seid;
-                a->av_state = AV_CAPS;
-                const uint8_t s = (uint8_t)(seid << 2);
-                av_cmd(a, SIG_GET_CAPS, &s, 1);
-                return;
-            }
+            if (tsep == 1 && media == 0 && !in_use) a->sep_cand[a->sep_n++] = seid;
         }
-        a->av_state = AV_FAIL;
-        fail(a, "no audio sink endpoint");
+        if (!a->sep_n) { a->av_state = AV_FAIL; fail(a, "no audio sink endpoint"); return; }
+        a->sink_seid = a->sep_cand[0];
+        a->av_state = AV_CAPS;
+        const uint8_t s = (uint8_t)(a->sink_seid << 2);
+        av_cmd(a, SIG_GET_CAPS, &s, 1);
     } else if ((signal == SIG_GET_CAPS || signal == SIG_GET_ALL_CAPS) && a->av_state == AV_CAPS) {
         size_t cl = 0;
         const uint8_t* codec = find_cat(p, pn, CAT_CODEC, &cl);
-        if (!codec || cl < 6 || codec[1] != 0x00) { a->av_state = AV_FAIL; fail(a, "sink has no SBC"); return; }
+        if (!codec || cl < 6 || codec[1] != 0x00) {
+            a2_log(a, "AVDTP: sink endpoint %u is not SBC (codec %u)", a->sink_seid, codec && cl >= 2 ? codec[1] : 0xFF);
+            if (a->sep_i + 1u < a->sep_n) {
+                a->sink_seid = a->sep_cand[++a->sep_i];
+                const uint8_t s = (uint8_t)(a->sink_seid << 2);
+                av_cmd(a, SIG_GET_CAPS, &s, 1);
+                return;
+            }
+            a->av_state = AV_FAIL;
+            fail(a, "sink has no SBC");
+            return;
+        }
         choose_config(a, codec);
         a->av_state = AV_CONFIGURE;
         uint8_t c[2 + 2 + 2 + 6];
@@ -358,6 +565,7 @@ static void l2_progress(br_a2dp_t* a)
     }
     if (a->av_state == AV_STREAMING && a->l2_state != L2_STREAMING && a->media.up) {
         a->l2_state = L2_STREAMING;
+        a->resuming = 0;
         a->stream.media_cid = a->media.dcid;
         a->stream.media_mtu = a->media.peer_mtu;
         a2_log(a, "AVDTP: streaming, media CID 0x%04X MTU %u", a->media.dcid, a->media.peer_mtu);
@@ -379,6 +587,7 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             uint16_t mine = 0;
             if (psm == PSM_AVDTP && !a->sig.used) { c = &a->sig; mine = SIG_SCID; }
             else if (psm == PSM_AVDTP && !a->media.used && a->av_state == AV_NEED_MEDIA) { c = &a->media; mine = MEDIA_SCID; }
+            else if (psm == PSM_SDP && !a->sdp.used) { c = &a->sdp; mine = SDP_SCID; }
             uint8_t r[8];
             if (!c) {
                 put16(r, 0); put16(r + 2, scid); put16(r + 4, psm == PSM_AVDTP ? 0x0004 : 0x0002); put16(r + 6, 0);
@@ -388,12 +597,12 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             }
             memset(c, 0, sizeof *c);
             c->used = 1; c->incoming = 1; c->scid = mine; c->dcid = scid; c->peer_mtu = 672;
-            if (a->l2_state == L2_OFF) { a->l2_state = L2_WAIT_SINK; a->t_l2_start = now(a); }
+            if (c != &a->sdp && a->l2_state == L2_OFF) { a->l2_state = L2_WAIT_SINK; a->t_l2_start = now(a); }
             if (c == &a->media) a->l2_state = L2_MEDIA_CONNECTING;
             put16(r, mine); put16(r + 2, scid); put16(r + 4, 0); put16(r + 6, 0);
             sig(a, 0x03, ident, r, 8);
             ch_cfg_req(a, scid);
-            a2_log(a, "L2CAP: accepted incoming AVDTP channel -> 0x%04X", mine);
+            a2_log(a, "L2CAP: accepted incoming %s channel -> 0x%04X", psm == PSM_SDP ? "SDP" : "AVDTP", mine);
         } else if (code == 0x03 && len >= 8) { /* connection response */
             br_a2dp_ch_t* c = ch_by_scid(a, get16(d + 2));
             const uint16_t result = get16(d + 4);
@@ -413,9 +622,10 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             if (c) c->cfg_in = 1;
         } else if (code == 0x05 && len >= 6) { /* response to our configure request */
             br_a2dp_ch_t* c = ch_by_scid(a, get16(d));
-            if (c) {
-                c->cfg_out = get16(d + 4) == 0;
-                if (!c->cfg_out) fail(a, "L2CAP configuration refused");
+            const uint16_t result = get16(d + 4);
+            if (c && result != 4) {  /* 4 = pending: the final response follows */
+                c->cfg_out = result == 0;
+                if (!c->cfg_out) { a2_log(a, "L2CAP: configuration result %u", result); fail(a, "L2CAP configuration refused"); }
             }
         } else if (code == 0x0A && len >= 2) { /* information request */
             const uint16_t type = get16(d);
@@ -440,8 +650,8 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             }
         }
     }
-    br_a2dp_ch_t* cs[2] = {&a->sig, &a->media};
-    for (int k = 0; k < 2; ++k)
+    br_a2dp_ch_t* cs[3] = {&a->sig, &a->media, &a->sdp};
+    for (int k = 0; k < 3; ++k)
         if (cs[k]->used && cs[k]->cfg_in && cs[k]->cfg_out && !cs[k]->up && cs[k]->dcid) cs[k]->up = 1;
     l2_progress(a);
 }
@@ -450,6 +660,7 @@ static void l2_on_frame(br_a2dp_t* a, uint16_t cid, const uint8_t* p, size_t n)
 {
     if (cid == 0x0001) l2_on_signaling(a, p, n);
     else if (a->sig.used && cid == a->sig.scid) av_on_signal(a, p, n);
+    else if (a->sdp.used && a->sdp.up && cid == a->sdp.scid) sdp_on(a, p, n);
 }
 
 static void l2_start(br_a2dp_t* a)
@@ -466,6 +677,18 @@ static void auth_start(br_a2dp_t* a)
     a->io.random(a->io.ctx, a->au_rand, 16);
     a->auth_state = AU_RAND;
     lmp(a, OP_AU_RAND, 0, a->au_rand, 16);
+}
+
+/* Key size agreed: Kc from the ACO of the last authentication, reduced to the key size, then start encryption. */
+static void enc_start(br_a2dp_t* a)
+{
+    a->io.random(a->io.ctx, a->en_rand, 16);
+    uint8_t kc[16];
+    br_e3(a->cfg.link_key, a->en_rand, a->aco, kc);
+    br_e0_key_reduce(kc, a->key_size ? a->key_size : 16, a->kc);
+    a->auth_state = AU_START_ENC;
+    a->io.set_enc(a->io.ctx, 2, a->kc, a->cfg.own_addr); /* the sink encrypts its accept */
+    lmp(a, OP_START_ENC_REQ, 0, a->en_rand, 16);
 }
 
 /* Returns 1 if consumed. */
@@ -500,15 +723,25 @@ static int auth_on(br_a2dp_t* a, uint8_t op, uint8_t tid, const uint8_t* p, size
         lmp(a, OP_ENC_KEY_SIZE_REQ, 0, &sz, 1);
         return 1;
     }
-    if (op == OP_ENC_KEY_SIZE_REQ) { lmp_accept(a, tid, OP_ENC_KEY_SIZE_REQ); return 1; }
+    if (op == OP_ENC_KEY_SIZE_REQ) {
+        /* Core Vol 2 Part C 4.2.5.4: a sink that cannot use our size answers with its own proposal. 7 is the
+         * smallest size we take (the Core minimum; below that the key is not worth having). */
+        const uint8_t sz = n ? p[0] : 0;
+        if (a->auth_state != AU_KEY_SIZE) { lmp_accept(a, tid, OP_ENC_KEY_SIZE_REQ); return 1; }
+        if (sz < 7 || sz > 16) {
+            lmp_reject(a, tid, OP_ENC_KEY_SIZE_REQ, 0x20);
+            a->auth_state = AU_FAIL;
+            fail(a, "encryption key size too small");
+            return 1;
+        }
+        a2_log(a, "sink proposed key size %u", sz);
+        a->key_size = sz;
+        lmp_accept(a, tid, OP_ENC_KEY_SIZE_REQ);
+        enc_start(a);
+        return 1;
+    }
     if (op == OP_ACCEPTED && n >= 1 && p[0] == OP_ENC_KEY_SIZE_REQ && a->auth_state == AU_KEY_SIZE) {
-        a->io.random(a->io.ctx, a->en_rand, 16);
-        uint8_t kc[16];
-        br_e3(a->cfg.link_key, a->en_rand, a->aco, kc);
-        br_e0_key_reduce(kc, 16, a->kc);
-        a->auth_state = AU_START_ENC;
-        a->io.set_enc(a->io.ctx, 2, a->kc, a->cfg.own_addr); /* the sink encrypts its accept */
-        lmp(a, OP_START_ENC_REQ, 0, a->en_rand, 16);
+        enc_start(a);
         return 1;
     }
     if (op == OP_ACCEPTED && n >= 1 && p[0] == OP_START_ENC_REQ && a->auth_state == AU_START_ENC) {
@@ -516,6 +749,7 @@ static int auth_on(br_a2dp_t* a, uint8_t op, uint8_t tid, const uint8_t* p, size
         a->io.set_enc(a->io.ctx, 1, a->kc, a->cfg.own_addr);
         a2_log(a, "encryption on");
         if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_ENCRYPTED, NULL);
+        { const uint8_t off = 0; a->name_state = 1; lmp(a, OP_NAME_REQ, 0, &off, 1); }  /* for the saved-device list */
         l2_start(a);
         return 1;
     }
@@ -711,6 +945,21 @@ static void lmp_on(br_a2dp_t* a, const uint8_t* d, size_t n)
         if (!a->peer_setup) { a->peer_setup = 1; a->t_setup = now(a); }
         return;
     }
+    if (op == OP_NAME_RES && a->name_state == 1 && pn >= 2) {
+        /* name_res: offset, total length, 14 bytes of the name */
+        const size_t off = p[0], len = p[1] < BR_A2DP_NAME_MAX ? p[1] : BR_A2DP_NAME_MAX;
+        for (size_t i = 0; i < 14 && off + i < len && 2 + i < pn; ++i) a->peer_name[off + i] = (char)p[2 + i];
+        if (off + 14 < len) {
+            const uint8_t next = (uint8_t)(off + 14);
+            lmp(a, OP_NAME_REQ, 0, &next, 1);
+            return;
+        }
+        a->name_state = 2;
+        a->peer_name[len] = '\0';
+        a2_log(a, "sink name '%s'", a->peer_name);
+        if (len && a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_NAME, a->peer_name);
+        return;
+    }
     if (ssp_on(a, op, ext, tid, p, pn)) return;
     if (op != OP_ESCAPE4 && auth_on(a, op, tid, p, pn)) return;
     respond(a, op, ext, tid, p, pn);
@@ -770,6 +1019,16 @@ void br_a2dp_poll(br_a2dp_t* a)
         a->av_state = AV_DISCOVER;
         a2_log(a, "AVDTP: sink silent, running our discover");
         av_cmd(a, SIG_DISCOVER, NULL, 0);
+    }
+    if (a->resume_at && !a->resuming && a->av_state == AV_CONFIGURED && a->have_config && a->media.up &&
+        (int32_t)(t - a->resume_at) >= 0) {
+        a->resume_at = 0;
+        a->resuming = 1;
+        a->av_state = AV_STARTING;
+        a->l2_state = L2_STARTING;
+        a2_log(a, "AVDTP: restarting the suspended stream");
+        const uint8_t s = (uint8_t)(a->sink_seid << 2);
+        av_cmd(a, SIG_START, &s, 1);
     }
     if (a->av_state == AV_NEED_MEDIA && !a->media.used && a->t_need_media && t - a->t_need_media > 3000) {
         a->l2_state = L2_MEDIA_CONNECTING;

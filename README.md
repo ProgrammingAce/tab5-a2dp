@@ -37,6 +37,28 @@ Subsequent connections authenticate with that key and establish E0 encryption.
 The host opens or accepts the L2CAP AVDTP signaling channel, negotiates SBC
 capabilities, then opens and starts the media stream.
 
+Three details make this work with ordinary headphones, not just one test speaker:
+
+- **Paging any address.** The C6 sends each Classic packet as a BLE DTM frame. The
+  page response (FHS) originally carried the peer's sync word in the BLE header,
+  so the frame length was whatever the peer's address dictated; only about one
+  address in six could be paged. Since C6 1.4.253 the whole BR packet follows a
+  BLE header the firmware chooses (`page shift`), so every address works.
+- **Classic modulation index.** BLE transmits with a modulation index of about
+  0.5; Bluetooth Classic specifies 0.28-0.35, and some receivers (a Sennheiser
+  HDB 630 here) lose about 1.5 % of payload bits at 0.5 and reject almost every
+  audio packet. During a Classic session the P4 sets two C6 baseband TX
+  registers: `0x600A200C` bits 8-11 (a signed deviation trim, -8) and
+  `0x600A20EC` bits 24-31 (TX filter gain, 0x40 instead of 0xEC). That gives a
+  clean GFSK waveform at h = 0.33 (measured with a HackRF) with the carrier
+  unchanged; the BLE values are restored when the session ends. `a2dp brmod 0`
+  turns it off for comparison.
+- **Spec behaviour sinks rely on.** The host serves an SDP record for the A2DP
+  Source (some sinks refuse to open AVDTP without it), tries every audio sink
+  endpoint until one offers SBC (sinks often list AAC or vendor codecs first),
+  accepts a sink's smaller encryption key size (7-16 bytes), answers
+  GET_CONFIGURATION, and restarts the stream after a sink SUSPEND.
+
 ## How A2DP audio is achieved
 
 ```mermaid
@@ -66,7 +88,7 @@ internal tone off before feeding external PCM.
   configuration.
 - ESP-IDF **5.5.5**, target `esp32p4` for the demo.
 - Ordinary Bluetooth Classic A2DP headphones or speaker.
-- C6 running the custom **1.4.252** image in `firmware/network_adapter.bin`,
+- C6 running the custom **1.4.264** image in `firmware/network_adapter.bin`,
   installed and confirmed before launching the P4 demo. Stock Tab5 C6 firmware
   cannot run this implementation. See [C6 firmware](firmware/README.md).
 
@@ -97,7 +119,7 @@ python -m esptool --chip esp32p4 -p /dev/cu.usbmodem1101 -b 460800 \
   write_flash 0x0 tab5_a2dp_demo_merged.bin
 ```
 
-Either way the C6 needs the matching 1.4.252 image (see
+Either way the C6 needs the matching 1.4.264 image (see
 [C6 firmware](firmware/README.md)); the P4 images do not install it.
 
 ## Build and run
@@ -114,7 +136,7 @@ The component manager downloads the pinned BSP, Wi-Fi Remote and their normal
 transitive dependencies. Keep the vendored patched ESP-Hosted component: the
 stock component cannot substitute for its raw HCI transport.
 
-The screen shows the live A2DP state, saved peer, discovery results and
+The screen shows the live A2DP state, saved headphones, search results and
 test-tone controls in landscape orientation. The USB Serial/JTAG console remains
 available. Flashing installs the P4 application; it does not install the C6
 image. Pairing data is stored in the `a2dpn` NVS namespace. Reflashing with the
@@ -122,11 +144,15 @@ supplied partition layout preserves that data unless flash is erased.
 
 ## Touchscreen controls
 
-- **Connect** reconnects the saved device using its stored bond.
-- **Find devices** searches for discoverable devices. Put your headphones in
-  pairing mode first. Results use Bluetooth addresses; device names are not yet
-  decoded. Wait for discovery to finish, then tap your device to select it.
-- **Pair selected** pairs the selected address without adopting another device.
+- **Find devices** searches for discoverable devices for up to 40 seconds. Put
+  your headphones in pairing mode first. Results appear as they are found, audio
+  devices first, labelled by device class (headphones, headset, speaker...).
+- **Tap a found device** to pair it. During a search it pairs as soon as the
+  current search window ends. A device is saved only once pairing succeeds, so
+  a failed attempt does not touch the other saved devices.
+- **Tap a saved device** to connect it. Up to eight paired devices are kept,
+  most recently used first, with the name each device reports.
+- **Connect** reconnects the default (most recently used) saved device.
 - **Disconnect** stops the tone and cleanly detaches the link; it also cancels a
   search or connection attempt.
 - **Play 440 Hz tone / Stop tone** controls audio once streaming is established.
@@ -134,8 +160,7 @@ supplied partition layout preserves that data unless flash is erased.
 Controls are disabled when their action is unavailable. Radio operations run
 outside the LVGL task, so the display and touch remain responsive during paging
 and discovery. The screen appears before the radio starts and reports transport
-startup errors. Selecting a device clears the previous bond, matching the
-console `a2dp peer` command.
+startup errors.
 
 ## Demonstrate the feature from USB
 
@@ -143,14 +168,14 @@ Turn the headphones down and place your chosen device in pairing mode:
 
 ```text
 a2dp find
+a2dp list
 ```
 
-Select its address from the results (12 hex digits, most significant byte
-first):
+`a2dp list` prints the saved devices and the last search's results with an index.
+Pair one by index or address (most significant byte first, colons optional):
 
 ```text
-a2dp peer AABBCCDDEEFF
-a2dp connect pair
+a2dp pair 0
 ```
 
 Wait for streaming, then:
@@ -160,31 +185,28 @@ a2dp tone 440
 a2dp status
 ```
 
-You should hear the tone; status shows the connection and SBC frame counters.
-End with:
+You should hear the tone; status shows the connection, the SBC frame counter and
+the current bitpool. End with:
 
 ```text
 a2dp tone off
 a2dp stop
 ```
 
-On later runs, use `a2dp connect` to reuse the stored bond. Setting a peer again
-clears its key. `a2dp auto 1` enables bounded reconnect, including after boot;
-`a2dp auto 0` disables it. Always stop the link and wait for detach before
+On later runs, `a2dp connect` connects the default saved device and
+`a2dp connect <n>` a specific one from `a2dp list`; `a2dp forget <n>` removes one.
+`a2dp auto 1` enables bounded reconnect to the default device, including after
+boot; `a2dp auto 0` disables it. Always stop the link and wait for detach before
 resetting or reflashing: silent link loss can make a receiver temporarily refuse
-another connection.
+another connection (the host retries a "connection already exists" refusal after
+12 seconds).
 
-Two link safeguards run automatically. Receivers whose address makes the C6's
-FHS frame longer than one slot (BLE DTM length byte 56..80, for example a
-speaker with LAP `E91187`) are paged with the long-FHS mode: the C6 does not wait
-for their second page response, delays that receive slot so the first POLL
-keeps its timing, and returns to paging if the receiver never answers. After
-streaming starts, the P4 measures missed replies for two seconds and reconnects
-when more than 12 % are missed, up to three times (about six seconds of silence
-each). Some receivers share their radio with their own BLE links, and each
-connection lands at a random timing offset to them; a fresh connection usually
-avoids a bad offset. `a2dp qmax <pct>` changes the threshold (-1 forces the
-retries for testing); `a2dp lateskip`, `a2dp connls44` and `a2dp rxearly` are
+After streaming starts, the P4 measures missed replies for two seconds and
+reconnects when more than 12 % are missed, up to three times (about six seconds
+of silence each). Some receivers share their radio with their own BLE links, and
+each connection lands at a random timing offset to them; a fresh connection
+usually avoids a bad offset. `a2dp qmax <pct>` changes the threshold (-1 forces
+the retries for testing); `a2dp lateskip`, `a2dp connls44` and `a2dp rxearly` are
 radio tuning controls that apply to the next connection.
 
 A link can also drift into a bad phase minutes after it started, so the stream
@@ -192,12 +214,13 @@ adapts continuously: each second, more than 15 % missed replies or a full C6
 frame ring lowers the SBC bitpool by two (14, 12, 10, 8); five clean seconds
 raise it again. Audio quality drops during a bad phase instead of breaking up.
 The connection receive window (`ls44` 700) ends early enough that a missed
-reply costs one radio slot instead of two. `a2dp status` shows the current
-bitpool.
+reply costs one radio slot instead of two.
 
-The convenience command `a2dp pair` discovers and pairs the first audio device
-it finds; explicit discovery and address selection are preferable around
-multiple devices. `a2dp connect beep` loops the C6's built-in SBC beep for
+Diagnostics: `a2dp diag` prints the link counters (missed replies, retransmits,
+acknowledgements and the sink's reply headers), `a2dp chans` the missed replies
+per RF channel (interference shows up as a block of bad channels). The
+convenience command `a2dp pair` with no argument discovers and pairs the first
+audio device it finds. `a2dp connect beep` loops the C6's built-in SBC beep for
 diagnostics; the P4 tone demonstrates the full PCM and encoder path.
 
 ## Source layout
@@ -205,8 +228,8 @@ diagnostics; the P4 tone demonstrates the full PCM and encoder path.
 | Path | Purpose |
 | --- | --- |
 | `main/main.cpp` | Startup, UI command queue and USB console |
-| `main/ui.*` | LVGL touchscreen, discovery list and tone control |
-| `main/bt/a2dp_native.*` | P4 A2DP host, bonds, reconnect, PCM queue and SBC |
+| `main/ui.*` | LVGL touchscreen, device list and tone control |
+| `main/bt/a2dp_native.*` | P4 A2DP host, saved devices, reconnect, PCM queue, SBC and BR modulation |
 | `main/bt/radio_lab.*` | Vendor HCI protocol adapter |
 | `main/bt/bt_owner.*` | Raw HCI controller ownership |
 | `components/br_baseband/` | Classic protocol, crypto and baseband helpers |
@@ -221,6 +244,23 @@ build dependencies. The C6 firmware also includes LE Audio support and an update
 guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
+
+**2026-11-11, C6 1.4.253-1.4.264 update.** Developed and measured in the parent
+Tab5 firmware (same host, baseband and C6 code as this repository) with a
+Sennheiser HDB 630, which the earlier code could neither page (its address gave
+a 217-byte FHS frame) nor stream to:
+
+- Search finds it within 5 s; paging takes 0.5-3.6 s, then SSP pairing,
+  encryption, the SDP lookup and the endpoint walk (SBC is its fourth endpoint).
+- Before the modulation change it acknowledged 3 % of audio fragments (bitpool
+  fell to 8 with dropped frames, audibly almost silent). With the Classic
+  modulation index: 92 % acknowledged, 99.9 % of its replies ACK, missed replies
+  8-9 % (was about 30 %), bitpool steady at 14 and no SBC frames dropped in a
+  60-second run.
+- Not re-tested with these changes: the Galaxy Projector Speaker and Bose
+  headphones from the earlier validation, and this demo's own P4 build on
+  hardware. The prebuilt C6 image is the one installed and confirmed on the
+  development Tab5; the P4 images are a clean build of this repository.
 
 **2026-11-10, C6 1.4.247-1.4.252 update.** The radio changes (long-FHS paging,
 late-hook slot skip, FHS-anchored slot grid), the link-quality reconnect and the
@@ -254,10 +294,10 @@ checker reports `RESULT: PASS`, and the guard and CIS host tests pass.
 
 This is an experimental BR-only implementation using one-slot packets, a low SBC
 bitpool (8-14 for streaming, adapted to the link; advertised maximum 20), and a fixed local identity
-chosen to fit the DTM framing constraints. Multi-slot DH3/DH5, adaptive
-frequency hopping, AVRCP absolute volume and idle AVDTP suspension are not
-implemented. Receiver compatibility and reconnect after a real range loss remain
-unverified. Wi-Fi and BLE are unavailable while Classic mode owns the C6 radio.
+chosen to fit the DTM framing constraints. Multi-slot DH3/DH5, EDR, adaptive
+frequency hopping, AVRCP (remote control and absolute volume), legacy PIN pairing
+(pre-2.1 devices) and role switch are not implemented; incoming AVCTP is refused.
+Reconnect after a real range loss remains unverified. Wi-Fi and BLE are unavailable while Classic mode owns the C6 radio.
 It is a proof of concept, not a qualified Bluetooth product.
 
 ## Attribution

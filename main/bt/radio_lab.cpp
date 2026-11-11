@@ -150,7 +150,7 @@ void on_hci_rx(const uint8_t* p, uint32_t len) {
         return;
     }
     // IDF nimble/hci_common.h: LE RX Test OCF 0x1D, LE Test End OCF 0x1F.
-    if (len >= 7 && p[0] == 0x04 && p[1] == 0x0E && (rd16(p + 4) == 0x201D || rd16(p + 4) == 0x201E)) {
+    if (len >= 7 && p[0] == 0x04 && p[1] == 0x0E && (rd16(p + 4) == 0x201D || rd16(p + 4) == 0x201E || rd16(p + 4) == 0x2034)) {
         dtm_active = p[6] == 0;
         if (exec_capture(0x100, p[6], nullptr, 0)) return;
         std::printf("LAB reply dtm status=0x%02x on=%u\n", p[6], dtm_active);
@@ -218,7 +218,7 @@ void send(uint8_t sub, const uint8_t* args, size_t n) {
 
 void hci_cmd(uint16_t op, const uint8_t* params, uint8_t n) {
     uint8_t pkt[4 + 32];
-    if (exec_armed && (op == 0x201D || op == 0x201E || op == 0x201F)) { exec_wait = 0x100; exec_sent = true; }
+    if (exec_armed && (op == 0x201D || op == 0x201E || op == 0x201F || op == 0x2034)) { exec_wait = 0x100; exec_sent = true; }
     pkt[0] = 0x01;
     pkt[1] = static_cast<uint8_t>(op);
     pkt[2] = static_cast<uint8_t>(op >> 8);
@@ -491,6 +491,32 @@ void command(const char* line) {
         if (a.n == 3 && !std::strcmp(a.tok[2], "diag")) { p[0] = 27; send(Page, p, 1); return; }  // 1.4.250
         if (a.n == 4 && !std::strcmp(a.tok[2], "diag")) { p[0] = 27; p[1] = 0; send(Page, p, 2); return; }  // reset
         if (a.n == 3 && !std::strcmp(a.tok[2], "t3")) { p[0] = 26; send(Page, p, 1); return; }  // long-FHS timing log
+        if (a.n == 4 && !std::strcmp(a.tok[2], "shift")) {  // 1.4.253: FHS after our own BLE header (any peer address)
+            p[0] = 29; p[1] = static_cast<uint8_t>(num(a.tok[3]) != 0);
+            send(Page, p, 2); return;
+        }
+        if (a.n == 6 && !std::strcmp(a.tok[2], "fmem")) {  // 1.4.259 fmem <chan> <type> <sel>
+            p[0] = 33; p[1] = static_cast<uint8_t>(num(a.tok[3])); p[2] = static_cast<uint8_t>(num(a.tok[4])); p[3] = static_cast<uint8_t>(num(a.tok[5]));
+            send(Page, p, 4); return;
+        }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "pdac")) { p[0] = 34; put32(p + 1, hexnum(a.tok[3])); send(Page, p, 5); return; }  // hex
+        if (a.n == 6 && !std::strcmp(a.tok[2], "i2cr")) {  // 1.4.261 i2cr <block> <host> <reg> (hex)
+            p[0] = 36; p[1] = static_cast<uint8_t>(hexnum(a.tok[3])); p[2] = static_cast<uint8_t>(hexnum(a.tok[4])); p[3] = static_cast<uint8_t>(hexnum(a.tok[5]));
+            send(Page, p, 4); return;
+        }
+        if (a.n == 7 && !std::strcmp(a.tok[2], "i2cw")) {  // i2cw <block> <host> <reg> <value> (hex)
+            p[0] = 37; for (int i = 0; i < 4; ++i) p[1 + i] = static_cast<uint8_t>(hexnum(a.tok[3 + i]));
+            send(Page, p, 5); return;
+        }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "hmodend")) { p[0] = 39; put16(p + 1, static_cast<uint16_t>(num(a.tok[3]))); send(Page, p, 3); return; }  // 1.4.264
+        if (a.n == 3 && !std::strcmp(a.tok[2], "hmodq")) { p[0] = 39; send(Page, p, 1); return; }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "hmod")) { p[0] = 38; put32(p + 1, hexnum(a.tok[3])); send(Page, p, 5); return; }  // 1.4.263
+        if (a.n == 4 && !std::strcmp(a.tok[2], "frag")) { p[0] = 35; p[1] = static_cast<uint8_t>(num(a.tok[3])); send(Page, p, 2); return; }  // 1.4.260
+        if (a.n == 4 && !std::strcmp(a.tok[2], "dm1")) { p[0] = 32; p[1] = static_cast<uint8_t>(num(a.tok[3]) != 0); send(Page, p, 2); return; }  // 1.4.258
+        if (a.n == 4 && !std::strcmp(a.tok[2], "txpwr")) { p[0] = 31; p[1] = static_cast<uint8_t>(num(a.tok[3])); send(Page, p, 2); return; }  // 1.4.257
+        if (a.n == 3 && !std::strcmp(a.tok[2], "chanq")) { p[0] = 30; send(Page, p, 1); return; }  // 1.4.254
+        if (a.n == 4 && !std::strcmp(a.tok[2], "chanq")) { p[0] = 30; p[1] = 0; send(Page, p, 2); return; }  // reset
+        if (a.n == 3 && !std::strcmp(a.tok[2], "shift")) { p[0] = 29; send(Page, p, 1); return; }  // on, FHS sent
         if (a.n == 4 && !std::strcmp(a.tok[2], "r2skip")) {  // 1.4.247: enter the link without resp2 (long-FHS peers)
             p[0] = 24; p[1] = static_cast<uint8_t>(num(a.tok[3]) != 0);
             send(Page, p, 2); return;
@@ -511,7 +537,7 @@ void command(const char* line) {
             put32(p + 14, hexnum(a.tok[8]));
             send(Page, p, 18); return;
         }
-        std::printf("LAB error page: | off | test <X> [end_us] | end <us> | xfix <X|off> | kick <pairs> | r2ls44 <raw> | r2skip <0|1> | r2late <us> | t3 | diag [0] | lateskip <us> | det <0..3> | rxlog | trace | mask <hex> | conn <lap> <uap> <slots> [rxmax ls44] | connq | connlog <i> | lmp <idx> <start> <repeat> <seqn> [hex] | acl <idx> <start> <repeat> <seqn> <llid> [hex] | enc <on> <kc> <addr> | <tlap> <tuap> <olap> <ouap> <nap> <cod> <clk27_2> (hex)\n");
+        std::printf("LAB error page: | off | test <X> [end_us] | end <us> | xfix <X|off> | kick <pairs> | r2ls44 <raw> | shift [0|1] | r2skip <0|1> | r2late <us> | t3 | diag [0] | lateskip <us> | det <0..3> | rxlog | trace | mask <hex> | conn <lap> <uap> <slots> [rxmax ls44] | connq | connlog <i> | lmp <idx> <start> <repeat> <seqn> [hex] | acl <idx> <start> <repeat> <seqn> <llid> [hex] | enc <on> <kc> <addr> | <tlap> <tuap> <olap> <ouap> <nap> <cod> <clk27_2> (hex)\n");
         return;
     }
     if (!std::strcmp(c, "rawdump")) {  // rawdump [index]
@@ -534,6 +560,16 @@ void command(const char* line) {
         if (!need(3)) return;
         if (!std::strcmp(a.tok[2], "off")) {
             hci_cmd(0x201F, nullptr, 0);
+            return;
+        }
+        if (!std::strcmp(a.tok[2], "tx2")) {  // LE Enhanced Transmitter Test: channel length type phy (1 = 1M, 2 = 2M)
+            if (!need(7)) return;
+            if (scan.on || dtm_active) { std::printf("LAB error dtm tx2: stop scan/DTM first\n"); return; }
+            hci_cmd(0x0C03, nullptr, 0);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(num(a.tok[3 + i]));
+            dtm_active = true;
+            hci_cmd(0x2034, p, 4);
             return;
         }
         if (!std::strcmp(a.tok[2], "tx")) {

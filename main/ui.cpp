@@ -10,10 +10,11 @@ namespace demo_ui {
 namespace {
 QueueHandle_t commands;
 lv_obj_t *state_label, *peer_label, *detail_label, *tone_label, *device_list;
-lv_obj_t *connect_btn, *pair_btn, *scan_btn, *stop_btn, *tone_btn;
+lv_obj_t *connect_btn, *scan_btn, *stop_btn, *tone_btn;
 bool radio_ready = false;
 char radio_message[96] = "Starting the radio...";
-char list_signature[200] = "";
+char list_signature[1024] = "";
+char row_cmd[a2dp_native::kMaxSaved + a2dp_native::kMaxFound][40];  // console command per list row
 constexpr uint32_t bg = 0x0b1220, panel = 0x162235, ink = 0xeaf2fb, muted = 0x99adc5, accent = 0x50dfc3;
 
 void send(const char* text) {
@@ -28,15 +29,8 @@ void click(lv_event_t* e) {
     else send(action);
     ESP_LOGI("demo_ui", "Touch action: %s", action);
 }
-void choose(lv_event_t* e) {
-    auto* label = lv_obj_get_child(static_cast<lv_obj_t*>(lv_event_get_target(e)), 0);
-    const char* address = lv_label_get_text(label);
-    char cmd[64] = "a2dp peer ";
-    size_t n = std::strlen(cmd);
-    for (size_t i = 0; i < 17 && address[i]; ++i) if (address[i] != ':') cmd[n++] = address[i];
-    cmd[n] = '\0';
-    send(cmd);
-}
+// A found device pairs (a2dp pair <address>), a saved one connects (a2dp connect <n>).
+void choose(lv_event_t* e) { send(row_cmd[reinterpret_cast<intptr_t>(lv_event_get_user_data(e))]); }
 lv_obj_t* label(lv_obj_t* parent, const char* text, int x, int y, int width, const lv_font_t* font, uint32_t color = ink) {
     auto* l = lv_label_create(parent);
     lv_label_set_text(l, text);
@@ -76,38 +70,56 @@ void update(lv_timer_t*) {
     const auto st = a2dp_native::status();
     lv_label_set_text(state_label, !radio_ready ? "RADIO STARTUP" : st.streaming ? "CONNECTED / STREAMING" : st.running ? "CONNECTING / SEARCHING" : "READY");
     lv_obj_set_style_text_color(state_label, lv_color_hex(st.streaming ? accent : ink), 0);
-    lv_label_set_text_fmt(peer_label, "Headphones\n%s\n%s", st.have_peer ? st.peer : "No device selected", st.have_key ? "Pairing saved" : "Pair a device to get started");
+    const char* name = st.saved_count && st.saved[0].name[0] ? st.saved[0].name : st.have_peer ? st.peer : "No headphones saved";
+    lv_label_set_text_fmt(peer_label, "Headphones\n%s\n%s", name,
+                          st.have_key ? "Paired (default for Connect)" : "Find devices, then tap yours to pair");
     lv_label_set_text(detail_label, radio_ready ? (st.text[0] ? st.text : "Choose a device or connect your saved headphones.") : radio_message);
     lv_label_set_text(tone_label, st.tone_hz && st.streaming ? "440 Hz tone is playing" : "Tone is off");
     lv_label_set_text(lv_obj_get_child(tone_btn, 0), st.tone_hz ? "Stop tone" : "Play 440 Hz tone");
     enable(connect_btn, radio_ready && st.have_peer && !st.running);
-    enable(pair_btn, radio_ready && st.have_peer && !st.running);
     enable(scan_btn, radio_ready && !st.running);
     enable(stop_btn, radio_ready && st.running);
     enable(tone_btn, radio_ready && st.streaming);
 
-    a2dp_native::Device devices[8];
-    const size_t count = a2dp_native::devices(devices, 8);
-    char signature[200] = "";
-    for (size_t i = 0; i < count; ++i) std::strcat(signature, devices[i].address);
-    // Rebuild when the result set or selectable state changes.
-    std::strcat(signature, st.running ? "busy" : "idle");
+    // Rebuild the list when the found/saved sets or the busy state change.
+    char signature[sizeof list_signature] = "";
+    for (int i = 0; i < st.found_count; ++i) std::strcat(signature, st.found[i].addr);
+    std::strcat(signature, "|");
+    for (int i = 0; i < st.saved_count; ++i) { std::strcat(signature, st.saved[i].addr); std::strcat(signature, st.saved[i].name); }
+    std::strcat(signature, st.running ? (st.searching ? "search" : "busy") : "idle");
     if (!std::strcmp(signature, list_signature)) return;
     std::snprintf(list_signature, sizeof list_signature, "%s", signature);
     lv_obj_clean(device_list);
-    if (!count) {
+    if (!st.found_count && !st.saved_count) {
         label(device_list, "No devices yet.\nPut headphones in pairing mode,\nthen tap Find devices.", 0, 8, 382, &lv_font_montserrat_24, muted);
         return;
     }
-    for (size_t i = 0; i < count; ++i) {
+    auto row = [&](int idx, const char* top, const char* bottom, bool on) {
         auto* b = lv_button_create(device_list);
         lv_obj_set_size(b, LV_PCT(100), 70);
         lv_obj_set_style_bg_color(b, lv_color_hex(0x2a3d56), 0);
         auto* l = lv_label_create(b);
-        lv_label_set_text_fmt(l, "%s\n%s", devices[i].address, devices[i].audio ? "Audio device" : "Other device");
+        lv_label_set_text_fmt(l, "%s\n%s", top, bottom);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_18, 0); lv_obj_center(l);
-        enable(b, !st.running);
-        lv_obj_add_event_cb(b, choose, LV_EVENT_CLICKED, nullptr);
+        enable(b, on);
+        lv_obj_add_event_cb(b, choose, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<intptr_t>(idx)));
+    };
+    // Found while searching: tap to pair (also while the search still runs: it pairs after the current window).
+    for (int i = 0; i < st.found_count; ++i) {
+        const auto& d = st.found[i];
+        const int k = a2dp_native::kMaxSaved + i;
+        std::snprintf(row_cmd[k], sizeof row_cmd[k], "a2dp pair %s", d.addr);
+        char bottom[64];
+        std::snprintf(bottom, sizeof bottom, "%s%s - tap to pair", a2dp_native::device_kind(d.cod), d.saved ? " (saved)" : "");
+        row(k, d.addr, bottom, !st.running || st.searching);
+    }
+    // Saved (paired) headphones, most recently used first: tap to connect.
+    for (int i = 0; i < st.saved_count; ++i) {
+        const auto& d = st.saved[i];
+        std::snprintf(row_cmd[i], sizeof row_cmd[i], "a2dp connect %d", i);
+        char bottom[64];
+        std::snprintf(bottom, sizeof bottom, "%s - saved, tap to connect", d.addr);
+        row(i, d.name[0] ? d.name : a2dp_native::device_kind(d.cod), bottom, !st.running);
     }
 }
 } // namespace
@@ -137,11 +149,10 @@ void start(QueueHandle_t queue) {
     state_label = label(connection, "STARTING", 0, 0, 672, &lv_font_montserrat_28, accent);
     peer_label = label(connection, "", 0, 55, 672, &lv_font_montserrat_28);
     detail_label = label(connection, radio_message, 0, 176, 672, &lv_font_montserrat_24, muted);
-    connect_btn = button(connection, "Connect", "a2dp connect", 0, 270, 208, true);
-    pair_btn = button(connection, "Pair selected", "a2dp connect pair", 224, 270, 208);
-    stop_btn = button(connection, "Disconnect", "stop", 448, 270, 224);
+    connect_btn = button(connection, "Connect", "a2dp connect", 0, 270, 328, true);
+    stop_btn = button(connection, "Disconnect", "stop", 344, 270, 328);
     auto* nearby = card(root, 776, 140, 472, 436);
-    label(nearby, "Nearby devices", 0, 0, 424, &lv_font_montserrat_28);
+    label(nearby, "Devices", 0, 0, 424, &lv_font_montserrat_28);
     scan_btn = button(nearby, "Find devices", "a2dp find", 0, 53, 424, true);
     device_list = lv_obj_create(nearby);
     lv_obj_set_pos(device_list, 0, 137); lv_obj_set_size(device_list, 424, 244);
