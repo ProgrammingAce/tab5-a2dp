@@ -1,12 +1,23 @@
 {
-  "c6_version": "1.4.264",
-  "c6_image_sha256": "f5d6df90191fb2d25333d8c3b418db1386de7f28aca02e53939a5d9d8d1ec732",
-  "c6_image_origin": "parent tab5 working tree main/bt/c6/network_adapter.bin, built by tools/br_lab/session224/c6_release.sh from c6_fw 70b638b plus the uncommitted 1.4.247-1.4.264 radio_lab.c changes included in this repo (c6_fw/c6_firmware/main/radio_lab.c and radio_lab.h are identical); installed and confirmed on hardware 2026-11-11",
-  "c6_rebuild_check": "this repo's c6_fw source rebuilt with sdkconfig.release after reconfigure: verify_hooks RESULT: PASS, version string 1.4.264 (image hash differs by build metadata)",
-  "p4_source": "this repository (demo), commit 62ebca9 plus the 2026-11-11 update; host/baseband/radio_lab sources identical to the parent tab5 working tree of 2026-11-11 (parent base commit 75a76e7, changes uncommitted there)",
-  "p4_build": "clean build (idf.py fullclean), then a rebuild after a help-text change; idf.py -DIDF_TARGET=esp32p4 build + idf.py merge-bin",
-  "p4_app_sha256": "9298fbb678c864a9c7a1815aa6e3538b3af1fa06c37166b70946e4e04b43fb2f",
-  "p4_merged_sha256": "a30681507405f21806543b9e9629a922a1767de97cfd72e04da634d1189d41f9",
-  "p4_hardware_test": "not flashed; the same host code was run in the parent firmware (HDB 630, 92 % of audio fragments acknowledged)",
-  "idf_version": "5.5.5"
+  "c6_version": "1.4.266",
+  "c6_image_sha256": "74e68e89f83238287a2f6858dd4991ee5d51a588363e6219267da78d6c6f7888",
+  "c6_image_origin": "Exact parent Tab5 image installed and confirmed on hardware 2026-11-11; matching radio_lab.c, radio_lab.h and br_flow.h included here.",
+  "c6_rebuild_check": "Standalone source reconfigured and rebuilt with ESP-IDF 5.5.5 and sdkconfig.release; verify_hooks RESULT: PASS; version 1.4.266. Rebuilt image differs by build metadata.",
+  "p4_source": "This repository, based on 25eebae plus the 2026-11-11 connection and flow-control update; key source hashes below identify the build source.",
+  "p4_build": "ESP-IDF 5.5.5; sdkconfig regenerated from sdkconfig.defaults; idf.py reconfigure build merge-bin, then incremental build merge-bin for final console help.",
+  "p4_app_sha256": "ec80bcca7770249ec6d062362e9da5aff49395aba569fd99b69bb52ea61d2d77",
+  "p4_merged_sha256": "a6cc2ad74218d227e0901ebd410b0001d159e82cb2962c2d24bc8b78d026acfd",
+  "p4_hardware_test": "Not flashed. Same host/radio code tested in parent firmware: latest short H630 transport run stayed connected about 100 seconds with no SBC drops. Long-term media NAK stalls remain unresolved; sustained audible playback not established by that transport check.",
+  "idf_version": "5.5.5",
+  "host_validation": "BR 90849 checks; C6 guard, crash and flow-control tests; CIS protocol, crypto and engine tests pass.",
+  "source_sha256": {
+    "main/Kconfig.projbuild": "709ebfcabdcb90c8fde5ee3074f475fb7b8bb86ea243d6c3025584fffff1f24d",
+    "main/main.cpp": "603e1101bd977f8329395e4c8a6c229d21c38c29d544d8a7b96b181a044eafb7",
+    "main/bt/a2dp_native.cpp": "3d719e2dd8ac60cca2c7e42168feb58fbb1d5d4da9902d4995100e49d33df6cc",
+    "main/bt/radio_lab.cpp": "ca99ca3ff1456dcb3bac8777ea337546328b62901395cc647eb1f7dce6202497",
+    "components/br_baseband/src/br_a2dp_src.c": "065d081ab1396b5951a06186060253bf8a12fa8fc9a1956198a6bbc89051b7e2",
+    "c6_fw/c6_firmware/main/radio_lab.c": "8266a7330525824291ced2db754254862ad64f77459f54758d0076723919e01a",
+    "c6_fw/c6_firmware/main/br_flow.h": "371a1866fca7a5e1d9137d8b646ebdd287388e9fd06656640e844d7f15631a69",
+    "c6_fw/c6_firmware/main/coprocessor_fw_version.txt": "e7a2fed95c45dc23809dad74b4a80dfb79e02c403bcc105834efc31d7874b23f"
+  }
 }

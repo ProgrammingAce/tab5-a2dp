@@ -51,6 +51,7 @@ enum { AV_IDLE, AV_DISCOVER, AV_CAPS, AV_CONFIGURE, AV_OPEN, AV_CONFIGURED, AV_N
 #define MEDIA_SCID 0x0042
 #define SDP_SCID 0x0043
 #define PSM_SDP 0x0001
+#define PSM_AVCTP 0x0017 /* Remote play/pause controls remain disabled by user preference. */
 #define OUR_MTU 672
 #define INT_SEID 1
 
@@ -592,7 +593,8 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             if (!c) {
                 put16(r, 0); put16(r + 2, scid); put16(r + 4, psm == PSM_AVDTP ? 0x0004 : 0x0002); put16(r + 6, 0);
                 sig(a, 0x03, ident, r, 8);
-                a2_log(a, "L2CAP: refused incoming PSM 0x%04X", psm);
+                if (psm == PSM_AVCTP) a2_log(a, "headphone remote controls disabled (AVCTP refused)");
+                else a2_log(a, "L2CAP: refused incoming PSM 0x%04X", psm);
                 continue;
             }
             memset(c, 0, sizeof *c);

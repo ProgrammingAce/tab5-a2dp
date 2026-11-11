@@ -2,7 +2,7 @@
 
 | File | What it is | Flash |
 | --- | --- | --- |
-| `network_adapter.bin` | Custom C6 application image **1.4.264** | C6 installer (below) |
+| `network_adapter.bin` | Custom C6 application image **1.4.266** | C6 installer (below) |
 | `p4/bootloader.bin` | P4 bootloader | `0x2000` |
 | `p4/partition-table.bin` | Partition table (`partitions.csv`) | `0x8000` |
 | `p4/ota_data_initial.bin` | OTA data (boots `ota_0`) | `0xf000` |
@@ -15,7 +15,7 @@ ESP-IDF version. P4 flashing commands are in the [main README](../README.md#flas
 
 ## ESP32-C6 image
 
-`network_adapter.bin` is the custom **1.4.264** C6 application image used by
+`network_adapter.bin` is the custom **1.4.266** C6 application image used by
 this POC: the exact image installed and confirmed on the development Tab5. It is
 an application image, not a merged full-flash image and not P4 firmware.
 1.4.247-1.4.251 add long-FHS paging, an FHS-anchored connection slot grid, link
@@ -28,6 +28,10 @@ reply headers); 1.4.256-1.4.264 add radio diagnostics used to find the Classic
 modulation registers (peek/poke during DTM, TX power, DM1/fragment-size media
 options, analog I2C access, an experimental DCO-gain switch). The P4 demo uses
 the shifted FHS, the statistics and peek/poke (for the modulation registers).
+
+1.4.265 adds persistent ACL payload flow control and POLL sequence tracking.
+1.4.266 serializes media publication with command FIFO writes and adds frozen
+outgoing media snapshots. See the main README for the remaining H630 limits.
 
 From this directory, verify it with:
 

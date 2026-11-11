@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "bt/bt_owner.h"
 #include "esp_hosted_cyberdeck.h"
@@ -41,6 +42,8 @@ esp_hosted_cyberdeck_hci_rx_cb_t saved_cb = nullptr;
 SemaphoreHandle_t exec_mutex = nullptr, exec_done = nullptr;
 volatile int exec_wait = -1;
 volatile bool exec_armed = false, exec_quiet = true, exec_sent = false;
+bool exec_default_quiet = true;
+std::once_flag exec_init;
 uint8_t exec_buf[255];
 volatile size_t exec_len = 0;
 volatile int exec_status = 0;
@@ -52,8 +55,9 @@ bool exec_capture(int key, uint8_t status, const uint8_t* d, size_t n) {
     if (n) std::memcpy(exec_buf, d, exec_len);
     exec_status = status;
     exec_wait = -1;
+    const bool quiet = exec_quiet;
     xSemaphoreGive(exec_done);
-    return exec_quiet;
+    return quiet;
 }
 bool have_controller = false;
 bool dtm_active = false;
@@ -280,11 +284,12 @@ uint32_t hexnum(const char* s) { return static_cast<uint32_t>(std::strtoul(s, nu
 
 }  // namespace
 
-void command(const char* line) {
+static void command_impl(const char* line) {
     char buf[200];
     std::snprintf(buf, sizeof(buf), "%s", line);
     Args a;
-    for (char* t = std::strtok(buf, " \t"); t && a.n < 12; t = std::strtok(nullptr, " \t")) a.tok[a.n++] = t;
+    char* save = nullptr;
+    for (char* t = strtok_r(buf, " \t", &save); t && a.n < 12; t = strtok_r(nullptr, " \t", &save)) a.tok[a.n++] = t;
     if (a.n < 2 || std::strcmp(a.tok[0], "lab") != 0) {
         std::printf("LAB error usage: lab ping|enter|exit|release|tone|stop|hop|rx|bletx|peek|poke|call|rxfreq|reboot\n");
         return;
@@ -468,6 +473,11 @@ void command(const char* line) {
             p[0] = 21; p[1] = static_cast<uint8_t>(num(a.tok[3])); put16(p + 2, static_cast<uint16_t>(hexnum(a.tok[4])));
             p[4] = static_cast<uint8_t>(num(a.tok[5])); put32(p + 5, num(a.tok[6]));
             send(Page, p, 9); return;
+        }
+        if (a.n == 4 && !std::strcmp(a.tok[2], "media")) {
+            if (!std::strcmp(a.tok[3], "cap")) { p[0] = 40; send(Page, p, 1); }
+            else { p[0] = 41; put16(p + 1, static_cast<uint16_t>(num(a.tok[3]))); send(Page, p, 3); }
+            return;
         }
         if (a.n == 4 && !std::strcmp(a.tok[2], "connbuf")) { p[0] = 15; p[1] = static_cast<uint8_t>(num(a.tok[3])); send(Page, p, 2); return; }
         if (a.n == 4 && !std::strcmp(a.tok[2], "mask")) { p[0] = 11; put32(p + 1, hexnum(a.tok[3])); send(Page, p, 5); return; }
@@ -760,20 +770,22 @@ void command(const char* line) {
     ESP_LOGD(TAG, "sent %s", c);
 }
 
-int exec(const char* line, uint8_t* out, size_t* out_len, int timeout_ms) {
-    if (!exec_mutex) {
+static int execute_line(const char* line, uint8_t* out, size_t* out_len, int timeout_ms, bool quiet) {
+    std::call_once(exec_init, [] {
         exec_mutex = xSemaphoreCreateMutex();
         exec_done = xSemaphoreCreateBinary();
-    }
+    });
+    if (!exec_mutex || !exec_done) return -2;
     xSemaphoreTake(exec_mutex, portMAX_DELAY);
     xSemaphoreTake(exec_done, 0);
     exec_wait = -1;
     exec_sent = false;
+    exec_quiet = quiet;
     exec_armed = true;
-    command(line);
+    command_impl(line);
     exec_armed = false;
     int rc = -2;  // the line sent nothing (parse error, controller not available)
-    if (exec_sent) {
+    if (exec_sent && have_controller) {
         if (xSemaphoreTake(exec_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
             rc = exec_status;
             if (out && out_len) {
@@ -785,9 +797,20 @@ int exec(const char* line, uint8_t* out, size_t* out_len, int timeout_ms) {
             exec_wait = -1;
             rc = -1;
         }
-    }
+    } else exec_wait = -1;
     xSemaphoreGive(exec_mutex);
     return rc;
+}
+
+int exec(const char* line, uint8_t* out, size_t* out_len, int timeout_ms) {
+    return execute_line(line, out, out_len, timeout_ms, exec_default_quiet);
+}
+
+void command(const char* line) {
+    // Console requests share reply subcommands with the live A2DP worker. Keep
+    // ownership through the reply, or a console Page response can masquerade
+    // as the worker's connq and falsely terminate a healthy link.
+    execute_line(line, nullptr, nullptr, 1500, false);
 }
 
 bool push_sbc(const uint8_t* frames, uint8_t n, uint8_t frame_len) {
@@ -801,6 +824,6 @@ bool push_sbc(const uint8_t* frames, uint8_t n, uint8_t frame_len) {
     return true;
 }
 
-void set_verbose(bool on) { exec_quiet = !on; }
+void set_verbose(bool on) { exec_default_quiet = !on; }
 
 }  // namespace radio_lab

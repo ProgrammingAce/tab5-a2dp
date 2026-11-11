@@ -1,0 +1,4 @@
+# ESP-Hosted 1.4 uses this legacy symbol; esp_wifi_remote 0.8 no longer defines it.
+config SLAVE_IDF_TARGET_ESP32C6
+    bool
+    default y

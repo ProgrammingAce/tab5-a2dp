@@ -88,7 +88,7 @@ internal tone off before feeding external PCM.
   configuration.
 - ESP-IDF **5.5.5**, target `esp32p4` for the demo.
 - Ordinary Bluetooth Classic A2DP headphones or speaker.
-- C6 running the custom **1.4.264** image in `firmware/network_adapter.bin`,
+- C6 running the custom **1.4.266** image in `firmware/network_adapter.bin`,
   installed and confirmed before launching the P4 demo. Stock Tab5 C6 firmware
   cannot run this implementation. See [C6 firmware](firmware/README.md).
 
@@ -119,7 +119,7 @@ python -m esptool --chip esp32p4 -p /dev/cu.usbmodem1101 -b 460800 \
   write_flash 0x0 tab5_a2dp_demo_merged.bin
 ```
 
-Either way the C6 needs the matching 1.4.264 image (see
+Either way the C6 needs the matching 1.4.266 image (see
 [C6 firmware](firmware/README.md)); the P4 images do not install it.
 
 ## Build and run
@@ -201,13 +201,16 @@ resetting or reflashing: silent link loss can make a receiver temporarily refuse
 another connection (the host retries a "connection already exists" refusal after
 12 seconds).
 
-After streaming starts, the P4 measures missed replies for two seconds and
-reconnects when more than 12 % are missed, up to three times (about six seconds
-of silence each). Some receivers share their radio with their own BLE links, and
-each connection lands at a random timing offset to them; a fresh connection
-usually avoids a bad offset. `a2dp qmax <pct>` changes the threshold (-1 forces
-the retries for testing); `a2dp lateskip`, `a2dp connls44` and `a2dp rxearly` are
-radio tuning controls that apply to the next connection.
+Missed-reply quality reconnects are disabled by default (`a2dp qmax 100`).
+The old 12 % threshold could deliberately disconnect otherwise usable H630 links.
+Automatic reconnect after actual link loss and adaptive SBC bitpool remain enabled.
+For lab experiments, `a2dp qmax <pct>` below 100 enables the two-second startup
+quality check with up to three reconnects; -1 forces retries. `a2dp lateskip`,
+`a2dp connls44` and `a2dp rxearly` apply to the next connection.
+
+Headphone remote play/pause requests are ignored: incoming AVCTP is refused and
+cannot suspend the local stream. This cannot disable the headphones' own wear
+sensor or local muting; those settings belong to the headphones.
 
 A link can also drift into a bad phase minutes after it started, so the stream
 adapts continuously: each second, more than 15 % missed replies or a full C6
@@ -244,6 +247,39 @@ build dependencies. The C6 firmware also includes LE Audio support and an update
 guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
+
+**2026-11-11, C6 1.4.265-1.4.266 update.** The P4 now serializes console
+and native radio commands so a diagnostic reply cannot be mistaken for a lost
+connection. The C6 preserves ACL payload flow control across LMP packets,
+allows LMP while media is stopped, preserves the last SEQN on POLL, and
+serializes media-PDU publication with command FIFO writes. Regression tests
+cover flow control and refusal of headphone remote controls during streaming.
+
+In the parent firmware, the latest short H630 run stayed connected throughout
+about 100 seconds, with 47,022 additional acknowledged fragments across the
+92-second sampling interval and no SBC drops. **Long-term H630 stability remains
+unresolved:** earlier runs stalled with repeated media NAKs despite valid SBC
+and encrypted packets. This short transport check does not establish sustained
+audible playback. The rebuilt standalone P4 image has not been flashed or
+hardware-tested; the bundled C6 1.4.266 image was installed and confirmed in the
+parent firmware. No device firmware was changed for this publication.
+
+Diagnostics now include payload-flow counters in `a2dp diag`, `a2dp sbc` for a
+single encoded frame batch, `a2dp checktx <firstslot> <count> <hex>` for local
+captured-packet CRC verification (count 1..4096), and `lab page media cap` /
+`lab page media <offset>` for a frozen outgoing media-PDU snapshot. Capture
+output may contain audio; avoid publishing private recordings.
+
+The standalone build also includes the legacy ESP-Hosted C6 target symbol needed
+by the pinned Wi-Fi Remote dependency.
+
+Host regression checks can be run from the repository root:
+
+```sh
+sh tests/run_host_tests.sh
+sh c6_fw/c6_firmware/test/run_host_tests.sh
+sh c6_fw/cis_ll/test/run.sh
+```
 
 **2026-11-11, C6 1.4.253-1.4.264 update.** Developed and measured in the parent
 Tab5 firmware (same host, baseband and C6 code as this repository) with a

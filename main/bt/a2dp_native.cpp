@@ -83,10 +83,14 @@ TaskHandle_t task = nullptr, enc_task = nullptr;
 std::atomic<int> reconnect_left{0};
 std::atomic<int64_t> reconnect_at{0};
 // Link-quality retry: some peers (the Galaxy projector speaker) time-share their radio with their own BLE links, and
-// each connection lands at a random phase to them: ~2 % or 25-40 % missed replies for the life of the link. After
-// streaming starts we measure, and reconnect from a bad phase (each try is a fresh roll).
+// each connection lands at a random phase to them: ~2 % or 25-40 % missed replies for the life of the link.
+// A qmax below 100 opts into startup reconnects; otherwise only measure and adapt the bitpool.
 constexpr int kQualityRetries = 3;
-std::atomic<int> quality_max_pct{12};  // console: a2dp qmax <pct> (test: 0 forces the retries)
+// Keep established links by default. The adaptive encoder handles transient
+// loss; the old 12% startup cutoff repeatedly disconnected the H630 even at
+// 13% missed replies (see A2DP_PROGRESS.md, 2026-11-11 connection-quality retries).
+// Console: a2dp qmax <pct>; 100 disables quality retries, 0 forces them for tests.
+std::atomic<int> quality_max_pct{100};
 std::atomic<int> quality_left{0};
 std::atomic<int64_t> quality_at{0};
 std::atomic<bool> quality_start{false};
@@ -102,6 +106,7 @@ std::atomic<bool> auto_on{false}, user_stop{false};
 // NVS state cached for status() (the UI polls it)
 bool verbose = false;
 int tone_hz = 0;
+std::atomic<bool> dump_sbc{false};
 
 // PCM ring (interleaved stereo int16) between write_pcm() and the encoder task
 constexpr size_t kRingFrames = 8192;  // ~186 ms at 44.1 kHz
@@ -415,6 +420,19 @@ void feed_log_entry(const uint8_t* e, size_t n) {
         rc = br_packet_decode(air, 36 + 8 * 48, &ctx, &pkt);
     }
     if (rc != BR_OK || (pkt.hdr.type != BR_TYPE_DM1 && pkt.hdr.type != BR_TYPE_DH1)) return;
+    // Log only protocol metadata: authentication payloads contain secret material.
+    // Rate limit repeated packets so a stalled peer cannot flood the console.
+    if (verbose) {
+        static int64_t rx_log_at = 0;
+        const int64_t now = esp_timer_get_time();
+        if (pkt.llid == 3 || !pkt.pflow || now >= rx_log_at) {
+            rx_log_at = now + 1000000;
+            std::printf("A2DP RX: slot %lu type %u seq %u ack %u llid %u pflow %u len %u LMP %d\n",
+                        static_cast<unsigned long>(slot), pkt.hdr.type, pkt.hdr.seqn, pkt.hdr.arqn,
+                        pkt.llid, pkt.pflow, static_cast<unsigned>(pkt.len),
+                        pkt.llid == 3 && pkt.len ? pkt.payload[0] >> 1 : -1);
+        }
+    }
     br_a2dp_rx(&s->eng, pkt.llid, pkt.payload, pkt.len);
 }
 
@@ -478,6 +496,11 @@ void encoder_task(void*) {
         if (nf && flen && flen <= 64) {
             uint8_t blob[4 * 64];
             for (int i = 0; i < nf; ++i) std::memcpy(blob + i * flen, frames[i], flen);
+            if (dump_sbc.exchange(false)) {
+                char encoded[2 * sizeof blob + 1];
+                hex(encoded, blob, static_cast<size_t>(nf) * flen);
+                std::printf("A2DP SBC: frames %d bytes %u data %s\n", nf, flen, encoded);
+            }
             radio_lab::push_sbc(blob, static_cast<uint8_t>(nf), flen);
         }
     }
@@ -832,7 +855,8 @@ void session_task(void*) {
             else if (q_tx0 && now >= q_from + 2000000 && q.tx > q_tx0 + 500) {
                 q_done = true;
                 const uint32_t pct = 100 * (q.noreply - q_nr0) / (q.tx - q_tx0);
-                if (static_cast<int>(pct) > quality_max_pct && quality_left > 0 && !s->beep) {
+                const int max_pct = quality_max_pct.load();
+                if (max_pct < 100 && static_cast<int>(pct) > max_pct && quality_left > 0 && !s->beep) {
                     set_status("link quality poor (%lu %% missed): reconnecting", static_cast<unsigned long>(pct));
                     q_retry = true;
                     break;
@@ -1154,9 +1178,57 @@ void command(const char* line) {
     std::snprintf(buf, sizeof buf, "%s", line);
     char* tok[6] = {};
     int n = 0;
-    for (char* t = std::strtok(buf, " \t"); t && n < 6; t = std::strtok(nullptr, " \t")) tok[n++] = t;
+    char* save = nullptr;
+    for (char* t = strtok_r(buf, " \t", &save); t && n < 6; t = strtok_r(nullptr, " \t", &save)) tok[n++] = t;
     if (n < 2) { std::printf("A2DP usage: a2dp find | list | pair [<n found> | <addr>] | connect [<n saved>] [pair] [beep] | forget <n saved> | stop | status | auto <0|1> | peer <hex> | key <hex|clear> | tone <Hz|off>\n"); return; }
     const char* c = tok[1];
+    if (!std::strcmp(c, "sbc") && n == 2) {
+        if (!enc_task) std::printf("A2DP SBC: encoder is not running\n");
+        else dump_sbc = true;
+        return;
+    }
+    if (!std::strcmp(c, "checktx") && n == 5) {
+        // Check a receive-only RF capture against our session cipher without exporting the key.
+        // The capture must begin at the BR preamble; slot range compensates for USB capture latency.
+        const size_t bytes = std::strlen(tok[4]) / 2;
+        uint8_t air[52];
+        if (!s->enc_mode || bytes < 20 || bytes > sizeof air || !parse_hex(tok[4], air, bytes)) {
+            std::printf("A2DP checktx: need encrypted session and 20..52 captured bytes\n");
+            return;
+        }
+        const uint32_t first = static_cast<uint32_t>(std::strtoul(tok[2], nullptr, 10));
+        const uint32_t count = static_cast<uint32_t>(std::strtoul(tok[3], nullptr, 10));
+        if (!count || count > 4096 || first > UINT32_MAX - count) {
+            std::printf("A2DP checktx: slot range must be 1..4096\n");
+            return;
+        }
+        static br_pkt_t captured;
+        unsigned matches = 0;
+        for (uint32_t slot = first; slot < first + count; ++slot) {
+            if (((slot - first) & 31u) == 0) vTaskDelay(1);
+            const uint32_t clk = 4u * (slot + 1u);
+            br_link_ctx_t ctx = {};
+            ctx.lap = kOwnLap; ctx.uap = kOwnUap;
+            ctx.clk6 = static_cast<uint8_t>((clk >> 1) & 63u);
+            ctx.sync_tolerance = 4;
+            std::memset(&captured, 0, sizeof captured);
+            const br_status_t header_rc = br_packet_decode(air, bytes * 8, &ctx, &captured);
+            if (header_rc == BR_ERR_HEC || header_rc == BR_ERR_SYNC || captured.hdr.lt_addr != 1 ||
+                (captured.hdr.type != BR_TYPE_DM1 && captured.hdr.type != BR_TYPE_DH1)) continue;
+            br_e0_t e0;
+            br_e0_init(&e0, s->kc, kOwnAddr, clk);
+            ctx.e0 = &e0;
+            std::memset(&captured, 0, sizeof captured);
+            if (br_packet_decode(air, bytes * 8, &ctx, &captured) != BR_OK ||
+                (captured.hdr.type != BR_TYPE_DM1 && captured.hdr.type != BR_TYPE_DH1)) continue;
+            ++matches;
+            std::printf("A2DP checktx: CRC PASS slot %lu type %u seq %u llid %u len %u\n",
+                        static_cast<unsigned long>(slot), captured.hdr.type, captured.hdr.seqn,
+                        captured.llid, static_cast<unsigned>(captured.len));
+        }
+        std::printf("A2DP checktx: %u matches in %lu slots\n", matches, static_cast<unsigned long>(count));
+        return;
+    }
     if (!std::strcmp(c, "connect")) {
         bool pair = false, beep = false;
         int idx = 0;
@@ -1248,7 +1320,8 @@ void command(const char* line) {
     }
     if (!std::strcmp(c, "qmax") && n == 3) {
         quality_max_pct = std::max(-1, std::min(100, std::atoi(tok[2])));
-        std::printf("A2DP link-quality reconnect above %d %% missed replies\n", quality_max_pct.load());
+        if (quality_max_pct >= 100) std::printf("A2DP automatic link-quality reconnect disabled\n");
+        else std::printf("A2DP link-quality reconnect above %d %% missed replies\n", quality_max_pct.load());
         return;
     }
     if (!std::strcmp(c, "lateskip") && n == 3) {
@@ -1294,6 +1367,9 @@ void command(const char* line) {
         std::printf("A2DP diag: tx %lu noreply %lu hecfail %lu | fifo tx %lu retx %lu acked %lu | rx nak %lu ack %lu dup %lu"
                     " verified %lu verify_fail %lu\n", u32(14), u32(93 + 48), u32(93 + 32), u32(93 + 8), u32(93 + 12),
                     u32(93 + 16), u32(93 + 24), u32(93 + 28), u32(93 + 44), u32(93 + 36), u32(93 + 40));
+        if (bn >= 227)
+            std::printf("A2DP diag: payload flow %s, STOP %lu GO %lu, withheld TX slots %lu\n",
+                        b[226] ? "GO" : "STOP", u32(214), u32(218), u32(222));
         bn = sizeof b;
         if (lab("lab page chanq", b, &bn) == 0 && bn >= 234) {
             std::printf("A2DP diag: replies to our data %lu: ARQN=1 %lu, FLOW=stop %lu, types", u32(158), u32(162), u32(166));

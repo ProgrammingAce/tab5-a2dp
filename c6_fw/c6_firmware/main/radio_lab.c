@@ -39,6 +39,7 @@
 #include "cis_c6.h"
 #include "br/br.h"
 #include "br/br_fast.h"
+#include "br_flow.h"
 #include "sbc_beep.h"
 
 #include <string.h>
@@ -54,6 +55,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "fw_guard.h"
 #include "soc/soc.h"
@@ -631,6 +633,10 @@ static volatile uint32_t s_fifo_head, s_fifo_tail; /* head = oldest unacknowledg
 static volatile bool s_fifo_on;
 static volatile uint8_t s_tx_seqn, s_tx_inflight, s_rx_arqn;
 static volatile uint16_t s_fifo_last_tag;
+/* Both the command task and media task produce FIFO entries. Serialize complete
+ * L2CAP PDUs: an intervening LLID=2 would discard the media PDU being assembled
+ * by the peer (Core Vol 2 Part B 6.6.2). The radio ISR remains lock-free. */
+static SemaphoreHandle_t s_fifo_write_mu;
 static uint8_t s_mask[MASK_N][BR_FAST_PAYLOAD_BYTES];
 static volatile uint32_t s_mask_slot[MASK_N];
 static volatile uint32_t s_mask_fill;
@@ -644,6 +650,8 @@ static volatile uint32_t s_fifo_tx, s_fifo_retx, s_fifo_acked, s_fifo_nomask, s_
 	s_rx_verified, s_rx_verify_fail, s_rx_dup, s_rx_noreply, s_mask_us_max, s_mask_n;
 /* verify hand-off (ISR -> task): 0 idle, 1 pending, 2 verified */
 static volatile uint8_t s_rxv_state, s_rxv_seqn, s_rx_acked_seqn = 0xFF;
+static volatile br_flow_t s_peer_flow;
+static volatile uint32_t s_flow_stops, s_flow_goes, s_flow_blocked;
 static uint8_t s_rxv_buf[CONN_LOG_BYTES];
 static volatile uint32_t s_rxv_slot;
 static TaskHandle_t s_rxv_task;
@@ -659,6 +667,9 @@ static uint8_t s_sbc_ring[SBC_RING_N][SBC_FRAME_MAX];
 static uint8_t s_sbc_len[SBC_RING_N]; /* 1.4.252: per-frame length (the host adapts the bitpool mid-stream) */
 static volatile uint32_t s_sbc_w, s_sbc_r, s_sbc_drops, s_sbc_in;
 static volatile uint8_t s_sbc_flen, s_stream_src; /* source: 1 built-in beep, 2 host frames */
+static volatile bool s_media_capture_requested;
+static volatile unsigned s_media_capture_len;
+static uint8_t s_media_capture[4 + 13 + 15 * SBC_FRAME_MAX];
 /* 1.4.258: media in DM1 (2/3 FEC, 17 bytes) instead of DH1 (27 bytes, no FEC): for sinks that lose payload bits */
 static volatile bool s_stream_dm1;
 static volatile uint8_t s_stream_frag; /* 1.4.260: DH1 fragment bytes (0 = 27); diagnostics: success vs length */
@@ -734,7 +745,14 @@ IRAM_ATTR static void fifo_slot(uint8_t *dst, uint32_t n, uint32_t data, bool is
 		if (s_mask_slot[mi] == n) e = &s_fifo[s_fifo_head % FIFO_N];
 		else ++s_fifo_nomask;
 	}
-	const uint64_t h = s_hdr_tab[c6][e ? (e->type == BR_TYPE_DM1 ? 1 : 2) : 0][s_rx_arqn][e ? s_tx_seqn : 0];
+	/* Core Vol 2 Part B 4.5.3/6.6.2: STOP holds the pending packet; keep polling
+	 * and ACKing the peer so it can deliver a subsequent GO. A missing header
+	 * implicitly means header GO, but never clears a verified payload STOP. */
+	if (e && !br_flow_allow(&s_peer_flow, !hdr_ok || ((v >> 7) & 1u), e->plain[0] & 3u)) {
+		e = NULL; ++s_flow_blocked;
+	}
+	const uint8_t tx_seqn = br_flow_seqn(&s_peer_flow, e != NULL, s_tx_seqn);
+	const uint64_t h = s_hdr_tab[c6][e ? (e->type == BR_TYPE_DM1 ? 1 : 2) : 0][s_rx_arqn][tx_seqn];
 	for (unsigned i = 0; i < 8; ++i) dst[i] = (uint8_t)(h >> (8 * i));
 	if (e) {
 		br_fast_payload(e->type, e->plain, e->nbits, s_mask[mi], s_fec_tab, dst, 58);
@@ -792,6 +810,11 @@ static void fifo_verify_task(void *unused)
 			rc = br_packet_decode(air, 36 + 8 * CONN_LOG_BYTES, &ctx, &vp);
 		}
 		if (rc == BR_OK && vp.hdr.seqn == s_rxv_seqn && (vp.hdr.type == BR_TYPE_DM1 || vp.hdr.type == BR_TYPE_DH1)) {
+			const uint8_t old_go = s_peer_flow.payload_go;
+			br_flow_payload(&s_peer_flow, vp.llid, vp.pflow);
+			if (old_go != s_peer_flow.payload_go) {
+				if (s_peer_flow.payload_go) ++s_flow_goes; else ++s_flow_stops;
+			}
 			const unsigned e = s_conn_log_count % CONN_LOG_N;
 			memcpy(s_conn_log[e], s_rxv_buf, CONN_LOG_BYTES);
 			s_conn_log_slot[e] = s_rxv_slot;
@@ -807,7 +830,7 @@ static void fifo_verify_task(void *unused)
 }
 
 /* Queues one fragment (task context). Returns false when full. */
-static bool fifo_push(uint8_t type, uint8_t llid, const uint8_t *data, unsigned len)
+static bool fifo_push_locked(uint8_t type, uint8_t llid, const uint8_t *data, unsigned len)
 {
 	if (fifo_count() >= FIFO_N || (type == BR_TYPE_DM1 && len > 17) || len > 27) return false;
 	fifo_e_t *e = &s_fifo[s_fifo_tail % FIFO_N];
@@ -815,6 +838,23 @@ static bool fifo_push(uint8_t type, uint8_t llid, const uint8_t *data, unsigned 
 	e->nbits = (uint8_t)br_fast_plain(llid, 1, data, len, s_conn_aa_uap, e->plain);
 	s_fifo_tail = s_fifo_tail + 1u;
 	return true;
+}
+
+static bool fifo_push(uint8_t type, uint8_t llid, const uint8_t *data, unsigned len)
+{
+	if (!s_fifo_write_mu) return false;
+	xSemaphoreTake(s_fifo_write_mu, portMAX_DELAY);
+	const bool ok = s_fifo_on && fifo_push_locked(type, llid, data, len);
+	xSemaphoreGive(s_fifo_write_mu);
+	return ok;
+}
+
+static void capture_media_packet(const uint8_t *pkt, unsigned len)
+{
+	if (!s_media_capture_requested) return;
+	memcpy(s_media_capture, pkt, len);
+	s_media_capture_len = len;
+	s_media_capture_requested = false;
 }
 
 /* A2DP stream test: builds L2CAP (media CID) + RTP + SBC payload header + s_stream_fpp beep frames, fragments into
@@ -839,6 +879,10 @@ static void stream_task(void *unused)
 			const unsigned fl = s_stream_dm1 ? 17u : (s_stream_frag ? s_stream_frag : 27u);
 			const unsigned total = 4u + body, frags = (total + fl - 1u) / fl;
 			if (FIFO_N - fifo_count() < frags) { ++s_stream_full; vTaskDelay(1); continue; }
+			xSemaphoreTake(s_fifo_write_mu, portMAX_DELAY);
+			if (!s_stream_on || !s_fifo_on || FIFO_N - fifo_count() < frags) {
+				xSemaphoreGive(s_fifo_write_mu); vTaskDelay(1); continue;
+			}
 			pkt[0] = (uint8_t)body; pkt[1] = (uint8_t)(body >> 8); pkt[2] = (uint8_t)s_stream_dcid; pkt[3] = (uint8_t)(s_stream_dcid >> 8);
 			uint8_t *r = pkt + 4;
 			r[0] = 0x80; r[1] = 96; r[2] = (uint8_t)(seq >> 8); r[3] = (uint8_t)seq;
@@ -850,8 +894,10 @@ static void stream_task(void *unused)
 				o += s_sbc_len[e];
 			}
 			s_sbc_r = s_sbc_r + fpp;
+			capture_media_packet(pkt, total);
 			for (unsigned off = 0; off < total; off += fl)
-				(void)fifo_push(s_stream_dm1 ? BR_TYPE_DM1 : BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < fl ? total - off : fl);
+				(void)fifo_push_locked(s_stream_dm1 ? BR_TYPE_DM1 : BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < fl ? total - off : fl);
+			xSemaphoreGive(s_fifo_write_mu);
 			ts += fpp * 128u; ++seq; ++s_stream_pkts; s_stream_frames += fpp;
 			continue;
 		}
@@ -867,6 +913,10 @@ static void stream_task(void *unused)
 		const unsigned body = 13u + fpp * SBC_BEEP_FRAME_BYTES, total = 4u + body;
 		const unsigned frags = (total + 26u) / 27u;
 		if (FIFO_N - fifo_count() < frags) { ++s_stream_full; vTaskDelay(1); continue; }
+		xSemaphoreTake(s_fifo_write_mu, portMAX_DELAY);
+		if (!s_stream_on || !s_fifo_on || FIFO_N - fifo_count() < frags) {
+			xSemaphoreGive(s_fifo_write_mu); vTaskDelay(1); continue;
+		}
 		pkt[0] = (uint8_t)body; pkt[1] = (uint8_t)(body >> 8); pkt[2] = (uint8_t)s_stream_dcid; pkt[3] = (uint8_t)(s_stream_dcid >> 8);
 		uint8_t *r = pkt + 4;
 		r[0] = 0x80; r[1] = 96; r[2] = (uint8_t)(seq >> 8); r[3] = (uint8_t)seq;
@@ -875,8 +925,10 @@ static void stream_task(void *unused)
 		for (unsigned f = 0; f < fpp; ++f)
 			memcpy(r + 13 + f * SBC_BEEP_FRAME_BYTES, k_sbc_beep + ((frame + f) % SBC_BEEP_FRAMES) * SBC_BEEP_FRAME_BYTES,
 			       SBC_BEEP_FRAME_BYTES);
+		capture_media_packet(pkt, total);
 		for (unsigned off = 0; off < total; off += 27u)
-			(void)fifo_push(BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < 27u ? total - off : 27u);
+			(void)fifo_push_locked(BR_TYPE_DH1, off ? 1u : 2u, pkt + off, total - off < 27u ? total - off : 27u);
+		xSemaphoreGive(s_fifo_write_mu);
 		frame += fpp; ts += fpp * 128u; ++seq;
 		++s_stream_pkts; s_stream_frames += fpp;
 	}
@@ -906,16 +958,23 @@ static void fifo_reset(bool on, uint8_t first_seqn)
 {
 	s_fifo_on = false;
 	s_stream_on = false;
+	if (on && !s_fifo_write_mu) s_fifo_write_mu = xSemaphoreCreateMutex();
+	if (s_fifo_write_mu) xSemaphoreTake(s_fifo_write_mu, portMAX_DELAY);
+	on = on && s_fifo_write_mu;
 	s_fifo_head = s_fifo_tail = 0; s_fifo_last_tag = 0;
 	s_tx_seqn = first_seqn & 1u; s_tx_inflight = 0; s_rx_arqn = 0;
 	s_rxv_state = 0; s_rx_acked_seqn = 0xFF;
+	br_flow_reset(&s_peer_flow);
+	s_flow_stops = s_flow_goes = s_flow_blocked = 0;
 	s_fifo_tx = s_fifo_retx = s_fifo_acked = s_fifo_nomask = s_rx_nak = s_rx_ack = s_rx_hecfail = 0;
 	s_rx_verified = s_rx_verify_fail = s_rx_dup = s_rx_noreply = s_mask_us_max = s_mask_n = 0;
 	s_stream_pkts = s_stream_frames = s_stream_full = s_stream_skips = 0;
 	s_sbc_w = s_sbc_r = 0; s_sbc_drops = s_sbc_in = 0; s_sbc_flen = 0;
+	s_media_capture_requested = false; s_media_capture_len = 0;
 	s_mask_reset = true;
 	if (on && !s_rxv_task) xTaskCreate(fifo_verify_task, "conn_verify", 4096, NULL, configMAX_PRIORITIES - 2, &s_rxv_task);
 	s_fifo_on = on;
+	if (s_fifo_write_mu) xSemaphoreGive(s_fifo_write_mu);
 }
 
 static TaskHandle_t s_conn_task;
@@ -2095,6 +2154,18 @@ static void handle(const uint8_t *p, uint8_t plen)
 			out[0] = s_mod_tx != 0; wr32(out + 1, s_mod_tx); wr32(out + 5, s_mod_orig); wr32(out + 9, s_mod_waits);
 			wr32(out + 13, s_mod_wait_max); wr16(out + 17, s_mod_tx_us); reply(sub, RL_OK, out, 19); break;
 		}
+		if (n == 1 && a[0] == 40) {  /* capture the next complete outgoing L2CAP media PDU */
+			s_media_capture_len = 0; s_media_capture_requested = true;
+			reply(sub, RL_OK, NULL, 0); break;
+		}
+		if (n == 3 && a[0] == 41) {  /* read frozen media snapshot: offset u16 -> total u16 + <=200 bytes */
+			if (s_media_capture_requested) { reply(sub, RL_ERR_BUSY, NULL, 0); break; }
+			const unsigned off = rd16(a + 1), total = s_media_capture_len;
+			if (!total || off >= total) { reply(sub, RL_ERR_PARAM, NULL, 0); break; }
+			const unsigned bytes = total - off > 200 ? 200 : total - off;
+			wr16(out, (uint16_t)total); memcpy(out + 2, s_media_capture + off, bytes);
+			reply(sub, RL_OK, out, 2 + bytes); break;
+		}
 		if (n == 2 && a[0] == 32) {  /* 1.4.258 media fragments in DM1 u8 (0 = DH1) */
 			s_stream_dm1 = a[1] != 0; out[0] = s_stream_dm1; reply(sub, RL_OK, out, 1); break;
 		}
@@ -2235,7 +2306,10 @@ static void handle(const uint8_t *p, uint8_t plen)
 			wr32(out + 193, s_sbc_w - s_sbc_r); wr32(out + 197, s_sbc_drops); wr32(out + 201, s_sbc_in);
 			/* 1.4.247 r2skip */
 			wr32(out + 205, s_page_r2skips); wr32(out + 209, s_conn_prov_ends); out[213] = s_page_r2skip;
-			reply(sub, RL_OK, out, 214); break;
+			/* 1.4.265: verified payload flow transitions and withheld TX slots. */
+			wr32(out + 214, s_flow_stops); wr32(out + 218, s_flow_goes);
+			wr32(out + 222, s_flow_blocked); out[226] = s_peer_flow.payload_go;
+			reply(sub, RL_OK, out, 227); break;
 		}
 		if (n == 2 && a[0] == 15 && a[1] < 4) {  /* buffer trace, 8 slots per page */
 			for (unsigned i = 0; i < 8; ++i) { wr32(out + 8 * i, s_conn_buf_trace[8 * a[1] + i][0]); wr32(out + 8 * i + 4, s_conn_buf_trace[8 * a[1] + i][1]); }

@@ -9,3 +9,5 @@ gcc $CFLAGS "$DIR/test/test_fw_guard_policy.c" "$DIR/main/fw_guard_policy.c" -o 
 "$TMP/fw_guard_policy_test"
 gcc $CFLAGS "$DIR/test/test_cis_c6_crash.c" "$DIR/main/cis_c6_crash.c" -o "$TMP/cis_c6_crash_test"
 "$TMP/cis_c6_crash_test"
+gcc $CFLAGS "$DIR/test/test_br_flow.c" -o "$TMP/br_flow_test"
+"$TMP/br_flow_test"

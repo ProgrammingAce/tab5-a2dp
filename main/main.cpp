@@ -17,7 +17,8 @@ static void help() {
               "(or a2dp pair: pair the first audio device found)\n"
               "After streaming starts: a2dp tone 440 | a2dp tone off | a2dp status | a2dp stop\n"
               "Saved headphones: a2dp list | a2dp connect [n] | a2dp forget <n> | Boot reconnect: a2dp auto 1\n"
-              "Diagnostics: a2dp diag | a2dp chans | BR modulation: a2dp brmod <hex|0>\n"
+              "Diagnostics: a2dp diag | a2dp chans | a2dp sbc | BR modulation: a2dp brmod <hex|0>\n"
+              "Quality reconnect: a2dp qmax <pct> (100/default disables); remote play/pause ignored\n"
               "Stop the link before resetting or flashing. Type help to repeat.");
 }
 
