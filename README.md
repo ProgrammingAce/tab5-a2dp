@@ -248,6 +248,17 @@ guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
 
+**2026-11-12, HDB 630 stall recovery backport.** The host now watches for two
+seconds without an acknowledged ACL media fragment while its transmit queue is
+non-empty. It flushes the stale fragment before detaching, then retries an
+unexpected audio stall after one second instead of five. This shortens recovery
+from the observed media-ACK lockup; it does not prevent the lockup. On the
+development Tab5, an eight-minute comparison still stalled at about 7m18s, then
+reconnected automatically. The separate experimental flow-control lag
+advertisement was not included because it did not prevent that stall. Sustained
+stall-free playback remains unresolved. Run `sh tools/test_a2dp_progress.sh`
+for the watchdog timing checks.
+
 **2026-11-11, C6 1.4.265-1.4.266 update.** The P4 now serializes console
 and native radio commands so a diagnostic reply cannot be mistaken for a lost
 connection. The C6 preserves ACL payload flow control across LMP packets,

@@ -1,4 +1,5 @@
 #include "bt/a2dp_native.h"
+#include "bt/a2dp_progress.h"
 
 #include <algorithm>
 #include <atomic>
@@ -271,8 +272,9 @@ void hex(char* dst, const uint8_t* v, size_t n) {
 
 struct Connq {
     uint8_t state = 0;
-    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, sbc_level = 0, tx = 0, noreply = 0, sbc_drops = 0;
-    bool ok = false;
+    uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, acked = 0, sbc_level = 0, tx = 0, noreply = 0, sbc_drops = 0;
+    bool ok = false, have_acked = false, have_flow = false, payload_go = false;
+    uint8_t next_seqn = 0;
 };
 Connq connq() {
     Connq q;
@@ -286,8 +288,10 @@ Connq connq() {
     q.count = u32(89);
     q.tx = u32(14);
     if (n >= 101) { q.head = u32(93); q.tail = u32(97); }
+    if (n >= 113) { q.acked = u32(109); q.have_acked = true; }
     if (n >= 145) q.noreply = u32(141);
     if (n >= 205) { q.sbc_level = u32(193); q.sbc_drops = u32(197); }
+    if (n >= 227) { q.have_flow = true; q.payload_go = b[226] != 0; q.next_seqn = b[162] & 1u; }
     q.ok = true;
     return q;
 }
@@ -816,9 +820,11 @@ void session_task(void*) {
     int64_t bp_at = 0;     // adaptive bitpool: 1 s windows
     uint32_t bp_tx = 0, bp_nr = 0, bp_drops = 0;
     int bp_clean = 0;
+    AudioProgress audio_progress;
+    bool audio_stalled = false;
     while (ok && !s->stop) {
         const Connq q = connq();
-        if (!q.ok) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!q.ok) { audio_progress.reset(); vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         if (!s->connected) {
             if (q.state == 4) {
                 s->connected = true;
@@ -839,6 +845,15 @@ void session_task(void*) {
             s->connected = false;
             break;
         }
+        if (s->state == State::Streaming && q.have_acked) {
+            if (audio_progress.stalled(esp_timer_get_time(), q.acked, q.head != q.tail)) {
+                audio_stalled = true;
+                set_status("audio stalled (no packet ACK for 2 s)");
+                std::printf("A2DP stalled: acked %lu, queued %lu; ending unusable link\n",
+                            static_cast<unsigned long>(q.acked), static_cast<unsigned long>(q.tail - q.head));
+                break;
+            }
+        } else audio_progress.reset();
         while (s->log_seen < q.count) {
             if (q.count - s->log_seen > 48) s->log_seen = q.count - 48;
             char line[40];
@@ -896,6 +911,24 @@ void session_task(void*) {
     while (enc_task) vTaskDelay(pdMS_TO_TICKS(10));
     if (was_connected) {
         lab("lab page stream 0 0 1 0");
+        if (audio_stalled) {
+            const Connq q = connq();
+            if (q.ok && q.state == 4 && q.have_flow && q.payload_go) {
+                // Flush the unacknowledged media fragment with an empty continuation at its SEQN.
+                char line[40];
+                std::snprintf(line, sizeof line, "lab page fiforeset 1 %u", q.next_seqn);
+                if (lab(line) == 0 && lab("lab page fifo 0 3 1 -") == 0) {
+                    bool flushed = false;
+                    for (int i = 0; i < 15; ++i) {
+                        const Connq f = connq();
+                        if (!f.ok || f.state != 4) break;
+                        if (f.acked) { flushed = true; break; }
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+                    std::printf("A2DP stale media flush: %s\n", flushed ? "ACKed" : "not ACKed");
+                }
+            }
+        }
         br_a2dp_detach(&s->eng, 0x13);
         for (int i = 0; i < 30; ++i) {  // until the detach is acknowledged
             const Connq q = connq();
@@ -906,7 +939,7 @@ void session_task(void*) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     cleanup_radio();
-    const bool lost = !std::strncmp(s->status, "link lost", 9) || !std::strncmp(s->status, "headphones did not", 18);
+    const bool lost = audio_stalled || !std::strncmp(s->status, "link lost", 9) || !std::strncmp(s->status, "headphones did not", 18);
     if (std::strncmp(s->status, "failed", 6) && std::strncmp(s->status, "headphones", 10) && !lost && !q_retry)
         set_status("stopped");
     if (q_retry && !user_stop) {
@@ -920,7 +953,7 @@ void session_task(void*) {
     }
     if (auto_on && !user_stop && lost && was_connected) {  // unexpected loss of a working link: try again
         if (reconnect_left <= 0) reconnect_left = 3;
-        reconnect_at = esp_timer_get_time() + 5 * 1000000LL;
+        reconnect_at = esp_timer_get_time() + (audio_stalled ? 1 : 5) * 1000000LL;
     }
     s->state = State::Idle;
     if (ring_space) xSemaphoreGive(ring_space);
