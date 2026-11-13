@@ -25,10 +25,17 @@ enum {
     BR_A2DP_EV_STREAMING = 3,  /* arg: const br_a2dp_stream_t* */
     BR_A2DP_EV_FAILED = 4,     /* arg: const char* reason */
     BR_A2DP_EV_DETACHED = 5,   /* arg: const uint8_t* reason code */
-    BR_A2DP_EV_SUSPENDED = 6,  /* arg: NULL (the sink suspended or closed the stream; after a suspend the engine
-                                * sends START again and reports BR_A2DP_EV_STREAMING once more) */
+    BR_A2DP_EV_SUSPENDED = 6,  /* arg: NULL (the stream is suspended or closed: by the sink, or by br_a2dp_suspend().
+                                * It stays suspended until the sink starts it or br_a2dp_start() is called; then
+                                * BR_A2DP_EV_STREAMING is reported again) */
     BR_A2DP_EV_NAME = 7,       /* arg: const char* (the sink's user-friendly name, UTF-8, read after encryption) */
+    BR_A2DP_EV_REMOTE = 8,     /* arg: br_a2dp_remote_t; AVRCP pass-through key event */
 };
+
+typedef struct {
+    uint8_t operation; /* AVRCP PASS THROUGH operation ID */
+    uint8_t pressed;   /* 1 on press, 0 on release */
+} br_a2dp_remote_t;
 
 typedef struct {
     uint16_t media_cid; /* peer's CID of the media channel: L2CAP frames for media go to this CID */
@@ -61,6 +68,7 @@ typedef struct {
     uint8_t pair;         /* no key (or it was refused): run SSP Just Works first */
     uint8_t max_bitpool;  /* our SEP and the configuration we choose stay <= this (link budget) */
     uint16_t avdtp_passive_ms; /* let the sink open AVDTP itself first (default 1500) */
+    uint8_t prefer_48k;   /* choose 48 kHz when the sink offers it (default 44.1 kHz) */
     const char* name;     /* LMP_name_res (default "Tab5") */
 } br_a2dp_cfg_t;
 
@@ -89,7 +97,7 @@ typedef struct br_a2dp {
     uint8_t ident;
     uint8_t rx[BR_A2DP_L2CAP_BUF];
     uint16_t rx_len;
-    br_a2dp_ch_t sig, media, sdp; /* sdp: incoming SDP channel (sinks look up our A2DP Source record first) */
+    br_a2dp_ch_t sig, media, sdp, avctp; /* incoming SDP and AVCTP control channels */
     uint8_t l2_state;
     uint32_t t_l2_start, t_sig_up, t_need_media;
     /* AVDTP */
@@ -98,13 +106,15 @@ typedef struct br_a2dp {
     br_a2dp_stream_t stream;
     /* sink endpoints from discover (audio sinks not in use), tried in order until one offers SBC */
     uint8_t sep_cand[8], sep_n, sep_i;
-    /* the sink suspended the stream: restart it ourselves (resume_at ms; resuming = our START is out) */
+    /* resuming = our START for a suspended stream is out (resume_at: unused, kept for layout) */
     uint8_t resuming;
     uint32_t resume_at;
     uint8_t key_size; /* negotiated encryption key size (16 unless the sink proposes 7..15) */
     /* remote name (LMP_name_req after encryption; 14-byte fragments) */
     uint8_t name_state, name_len;
     char peer_name[BR_A2DP_NAME_MAX + 1];
+    /* AVRCP: a registered play-status notification waiting for the next change */
+    uint8_t avrcp_notify, avrcp_notify_tid, avrcp_notify_subunit;
 } br_a2dp_t;
 
 void br_a2dp_init(br_a2dp_t* a, const br_a2dp_cfg_t* cfg, const br_a2dp_io_t* io);
@@ -118,6 +128,13 @@ void br_a2dp_poll(br_a2dp_t* a);
 void br_a2dp_detach(br_a2dp_t* a, uint8_t reason);
 /* 1 once AVDTP is streaming; then the stream parameters. */
 int br_a2dp_streaming(const br_a2dp_t* a);
+/* Source-initiated AVDTP SUSPEND (nothing to play, or the headset asked for a pause). Stop feeding media first.
+ * Returns 1 if the suspend is on its way (BR_A2DP_EV_SUSPENDED follows), 0 if the stream is not started.
+ * Calling it again before the answer sends the command again. */
+int br_a2dp_suspend(br_a2dp_t* a);
+/* AVDTP START for a suspended stream. Returns 1 if started or starting (BR_A2DP_EV_STREAMING follows), 0 if there
+ * is no configured, suspended stream. */
+int br_a2dp_start(br_a2dp_t* a);
 /* Builds the L2CAP frame for one RTP media packet (12-byte RTP + 1-byte SBC header + frames) into out; returns the
  * frame length (send with llid 2), 0 if not streaming or too long. */
 size_t br_a2dp_media_frame(const br_a2dp_t* a, uint16_t seq, uint32_t timestamp, const uint8_t* sbc, size_t sbc_len,

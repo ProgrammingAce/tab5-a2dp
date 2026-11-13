@@ -18,7 +18,9 @@ static void help() {
               "After streaming starts: a2dp tone 440 | a2dp tone off | a2dp status | a2dp stop\n"
               "Saved headphones: a2dp list | a2dp connect [n] | a2dp forget <n> | Boot reconnect: a2dp auto 1\n"
               "Diagnostics: a2dp diag | a2dp chans | a2dp sbc | BR modulation: a2dp brmod <hex|0>\n"
-              "Quality reconnect: a2dp qmax <pct> (100/default disables); remote play/pause ignored\n"
+              "Pause/resume: headphone keys | a2dp suspend | a2dp resume\n"
+              "Sample rate: a2dp rates [clear] (learned per device) | a2dp rate48 <0|1|auto>\n"
+              "Quality reconnect: a2dp qmax <pct> (100/default disables)\n"
               "Stop the link before resetting or flashing. Type help to repeat.");
 }
 

@@ -57,7 +57,12 @@ Three details make this work with ordinary headphones, not just one test speaker
   Source (some sinks refuse to open AVDTP without it), tries every audio sink
   endpoint until one offers SBC (sinks often list AAC or vendor codecs first),
   accepts a sink's smaller encryption key size (7-16 bytes), answers
-  GET_CONFIGURATION, and restarts the stream after a sink SUSPEND.
+  GET_CONFIGURATION, and honours a sink's SUSPEND (the stream stays paused until
+  the sink or the user starts it again).
+- **The sample rate each device handles.** A2DP requires every SBC sink to accept
+  44.1 and 48 kHz, but some handle one of them badly: the HDB 630 stops accepting
+  audio after seconds to minutes at 44.1 kHz and runs clean at 48 kHz. The host
+  learns the rate per saved device (see [Sample rate](#sample-rate)).
 
 ## How A2DP audio is achieved
 
@@ -75,6 +80,23 @@ AVDTP. The encoder produces SBC frames and sends them to the C6's stream ring in
 batches. The C6 adds A2DP media framing and transmits fragments over the
 encrypted Classic link. The receiving device decodes SBC using its ordinary A2DP
 sink. `a2dp tone 440` exercises this complete P4-to-headphones path.
+
+### Sample rate
+
+Each saved device has a learned rate, stored with its bond in NVS. A device
+starts from a first guess: 48 kHz for Sennheiser addresses (OUI `80:C3:BA`),
+44.1 kHz for everything else. Two media stalls at one rate while audio is
+playing switch the device to the other rate; the host ends the link and
+reconnects at the new rate at once, and the tone carries on. If the other rate
+stalls just as often, the rate is not the cause: the device goes back to its
+first guess and learning stops for it. Ten minutes of streaming without a stall
+clears earlier stalls (a headset taken off, a radio fade). A stall only counts
+when the rate in use is the one the host asked for.
+
+`a2dp rates` lists each saved device's learned rate and stall count; `a2dp rates
+clear` resets them. `a2dp rate48 0` or `1` fixes the rate at 44.1 or 48 kHz for
+testing and turns learning off; `a2dp rate48 auto` turns it back on. The logic
+is in `main/bt/a2dp_rate.h`, with host tests in `tests/br/a2dp_rate_test.cpp`.
 
 An application can replace the tone with its own PCM producer: wait for
 `a2dp_native::ready()`, obtain `rate()`, then feed interleaved stereo int16
@@ -186,7 +208,9 @@ a2dp status
 ```
 
 You should hear the tone; status shows the connection, the SBC frame counter and
-the current bitpool. End with:
+the current bitpool. With no audio for three seconds the host suspends the
+stream (AVDTP SUSPEND) and the link stays up; `a2dp tone 440` or the Play tone
+button starts it again. End with:
 
 ```text
 a2dp tone off
@@ -208,14 +232,16 @@ For lab experiments, `a2dp qmax <pct>` below 100 enables the two-second startup
 quality check with up to three reconnects; -1 forces retries. `a2dp lateskip`,
 `a2dp connls44` and `a2dp rxearly` apply to the next connection.
 
-Headphone remote play/pause requests are ignored: incoming AVCTP is refused and
-cannot suspend the local stream. This cannot disable the headphones' own wear
-sensor or local muting; those settings belong to the headphones.
+The headphones' play and pause keys work (AVRCP pass-through). Pause or stop
+pauses the tone and suspends the stream; play starts both again. A SUSPEND sent
+by the headphones themselves (their pause key or wear sensor) pauses the tone as
+well. `a2dp suspend` and `a2dp resume` do the same from the console.
 
 A link can also drift into a bad phase minutes after it started, so the stream
-adapts continuously: each second, more than 15 % missed replies or a full C6
-frame ring lowers the SBC bitpool by two (14, 12, 10, 8); five clean seconds
-raise it again. Audio quality drops during a bad phase instead of breaking up.
+adapts continuously: every 500 ms, more than 15 % media retransmissions or
+dropped SBC frames lower the SBC bitpool by four, down to 8; five clean seconds
+under 8 % raise it by two, up to 14. Audio quality drops during a bad phase
+instead of breaking up.
 The connection receive window (`ls44` 700) ends early enough that a missed
 reply costs one radio slot instead of two.
 
@@ -233,6 +259,7 @@ diagnostics; the P4 tone demonstrates the full PCM and encoder path.
 | `main/main.cpp` | Startup, UI command queue and USB console |
 | `main/ui.*` | LVGL touchscreen, device list and tone control |
 | `main/bt/a2dp_native.*` | P4 A2DP host, saved devices, reconnect, PCM queue, SBC and BR modulation |
+| `main/bt/a2dp_rate.h` | Per-device SBC sample-rate learning |
 | `main/bt/radio_lab.*` | Vendor HCI protocol adapter |
 | `main/bt/bt_owner.*` | Raw HCI controller ownership |
 | `components/br_baseband/` | Classic protocol, crypto and baseband helpers |
@@ -248,6 +275,18 @@ guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
 
+**2026-11-13, sync with the parent firmware.** Brings over the host changes
+made since 2026-11-12: source-initiated SUSPEND/START with an idle suspend after
+three seconds without audio, the headphones' play and pause keys, a media stall
+that keeps the link up (the stream resumes on the play key) instead of
+reconnecting, and per-device sample-rate learning ([Sample rate](#sample-rate)).
+The host now also advertises a 1792-byte flow-control lag (`kFeatures0`)
+instead of claiming an instant payload STOP. In the parent firmware the HDB 630
+at 48 kHz ran three 30-minute runs without a stall (off-head), where 44.1 kHz
+stalled in five of six shorter runs; that was the cause of the stalls described
+below. The rate-learning switch has not yet been exercised on hardware, and this
+standalone P4 image has not been flashed. C6 image unchanged (1.4.266).
+
 **2026-11-12, HDB 630 stall recovery backport.** The host now watches for two
 seconds without an acknowledged ACL media fragment while its transmit queue is
 non-empty. It flushes the stale fragment before detaching, then retries an
@@ -255,8 +294,8 @@ unexpected audio stall after one second instead of five. This shortens recovery
 from the observed media-ACK lockup; it does not prevent the lockup. On the
 development Tab5, an eight-minute comparison still stalled at about 7m18s, then
 reconnected automatically. The separate experimental flow-control lag
-advertisement was not included because it did not prevent that stall. Sustained
-stall-free playback remains unresolved. Run `sh tools/test_a2dp_progress.sh`
+advertisement was not included because it did not prevent that stall. (Resolved
+2026-11-13: the stall depends on the sample rate; see above.) Run `sh tools/test_a2dp_progress.sh`
 for the watchdog timing checks.
 
 **2026-11-11, C6 1.4.265-1.4.266 update.** The P4 now serializes console

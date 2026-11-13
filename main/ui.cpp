@@ -68,8 +68,8 @@ void enable(lv_obj_t* obj, bool on) {
 }
 void update(lv_timer_t*) {
     const auto st = a2dp_native::status();
-    lv_label_set_text(state_label, !radio_ready ? "RADIO STARTUP" : st.streaming ? "CONNECTED / STREAMING" : st.running ? "CONNECTING / SEARCHING" : "READY");
-    lv_obj_set_style_text_color(state_label, lv_color_hex(st.streaming ? accent : ink), 0);
+    lv_label_set_text(state_label, !radio_ready ? "RADIO STARTUP" : st.streaming ? "CONNECTED / STREAMING" : st.connected ? "CONNECTED / IDLE" : st.running ? "CONNECTING / SEARCHING" : "READY");
+    lv_obj_set_style_text_color(state_label, lv_color_hex(st.connected ? accent : ink), 0);
     const char* name = st.saved_count && st.saved[0].name[0] ? st.saved[0].name : st.have_peer ? st.peer : "No headphones saved";
     lv_label_set_text_fmt(peer_label, "Headphones\n%s\n%s", name,
                           st.have_key ? "Paired (default for Connect)" : "Find devices, then tap yours to pair");
@@ -79,7 +79,8 @@ void update(lv_timer_t*) {
     enable(connect_btn, radio_ready && st.have_peer && !st.running);
     enable(scan_btn, radio_ready && !st.running);
     enable(stop_btn, radio_ready && st.running);
-    enable(tone_btn, radio_ready && st.streaming);
+    // An idle link suspends its stream after 3 s without audio; the tone starts it again.
+    enable(tone_btn, radio_ready && st.connected);
 
     // Rebuild the list when the found/saved sets or the busy state change.
     char signature[sizeof list_signature] = "";

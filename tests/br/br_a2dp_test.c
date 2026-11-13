@@ -34,7 +34,8 @@ typedef struct {
     uint32_t t;
     int enc_mode, enc_rx_before_start;
     uint8_t kc[16];
-    int ev_paired, ev_encrypted, ev_streaming, ev_failed, ev_name, ev_suspended;
+    int ev_paired, ev_encrypted, ev_streaming, ev_failed, ev_name, ev_suspended, ev_remote;
+    br_a2dp_remote_t remote;
     char name[64];
     uint8_t link_key[16];
     br_a2dp_stream_t stream;
@@ -57,6 +58,7 @@ static void io_event(void* c, int ev, const void* arg)
     if (ev == BR_A2DP_EV_PAIRED) { ++w->ev_paired; memcpy(w->link_key, arg, 16); }
     if (ev == BR_A2DP_EV_ENCRYPTED) ++w->ev_encrypted;
     if (ev == BR_A2DP_EV_SUSPENDED) ++w->ev_suspended;
+    if (ev == BR_A2DP_EV_REMOTE) { ++w->ev_remote; w->remote = *(const br_a2dp_remote_t*)arg; }
     if (ev == BR_A2DP_EV_NAME) { ++w->ev_name; snprintf(w->name, sizeof w->name, "%s", (const char*)arg); }
     if (ev == BR_A2DP_EV_STREAMING) { ++w->ev_streaming; w->stream = *(const br_a2dp_stream_t*)arg; }
     if (ev == BR_A2DP_EV_FAILED) { ++w->ev_failed; snprintf(w->fail_reason, sizeof w->fail_reason, "%s", (const char*)arg); }
@@ -72,7 +74,7 @@ typedef struct {
     int aac_first;     /* SEID 1 is an AAC endpoint (the source must move on to SEID 2) */
     int key_counter;   /* answers key size 16 with its own proposal */
     int suspend_once;  /* suspends the stream once it started; then expects the source's START */
-    int key_size, caps_asked[3], suspended, starts, get_config_ok;
+    int key_size, caps_asked[3], suspended, starts, get_config_ok, suspends, avrcp_changed;
     int sdp_check;     /* looks up the source's SDP record first (24-byte chunks: continuation) */
     uint16_t sdp_src_cid;
     int sdp_in, sdp_out, sdp_sent, sdp_done, sdp_chunks;
@@ -149,6 +151,10 @@ static void s_av_step(sink_t* s)
 
 static void sink_l2_frame(sink_t* s, uint16_t cid, const uint8_t* p, size_t n)
 {
+    if (cid == 0x88) { /* our AVCTP channel: AVRCP CHANGED play-status notification */
+        if (n >= 15 && p[1] == 0x11 && p[2] == 0x0E && p[3] == 0x0D && p[9] == 0x31) s->avrcp_changed = p[14];
+        return;
+    }
     if (cid == 0x0001) {
         for (size_t i = 0; i + 4 <= n;) {
             const uint8_t code = p[i], ident = p[i + 1];
@@ -226,8 +232,9 @@ static void sink_l2_frame(sink_t* s, uint16_t cid, const uint8_t* p, size_t n)
             const uint8_t aac[] = {1, 0, 7, 8, 0, 2, 0x80, 0x01, 0x8C, 0x84, 0xE2, 0x00};
             if (s->aac_first && seid == 1) s_av(s, label, 2, signal, aac, sizeof aac);
             else s_av(s, label, 2, signal, sbc, sizeof sbc);
-        } else if (signal == 3 || signal == 6 || signal == 7) {
+        } else if (signal == 3 || signal == 6 || signal == 7 || signal == 9) {
             s_av(s, label, 2, signal, NULL, 0);
+            if (signal == 9) ++s->suspends;
             if (signal == 7) { s->started = 1; ++s->starts; }
             if (signal == 7 && s->suspend_once && !s->suspended) {
                 s->suspended = 1;
@@ -427,8 +434,27 @@ void run_a2dp_tests(void)
     /* S7: the sink suspends once streaming started: the source answers GET_CONFIGURATION and restarts the stream */
     g_suspend_once = 1;
     scenario(0, 1, key, 0, 0, 0, 0, &w, &s, &a);
-    CHECK(s.suspended && w.ev_suspended == 1 && s.starts == 2 && w.ev_streaming == 2 && s.get_config_ok && !w.ev_failed);
+    CHECK(s.suspended && w.ev_suspended == 1 && s.get_config_ok && !w.ev_failed);
+    /* ... and the source honours the pause: no START of its own, however long it waits */
+    CHECK(s.starts == 1 && w.ev_streaming == 1 && !br_a2dp_streaming(&a));
     if (w.ev_failed) fprintf(stderr, "S7 failed: %s\n", w.fail_reason);
+    /* the application resumes (local play, or the headset's play key) */
+    CHECK(br_a2dp_start(&a) == 1);
+    run(&w, &a, &s, 1000);
+    CHECK(s.starts == 2 && w.ev_streaming == 2 && br_a2dp_streaming(&a) && !w.ev_failed);
+    /* S7b: source-initiated SUSPEND (nothing to play / headset pause key), then START again */
+    CHECK(br_a2dp_suspend(&a) == 1 && !br_a2dp_streaming(&a));
+    {
+        uint8_t f[64], sbc[35] = {0x9C};
+        CHECK(br_a2dp_media_frame(&a, 1, 0, sbc, sizeof sbc, 1, f, sizeof f) == 0); /* no media while suspending */
+    }
+    run(&w, &a, &s, 1000);
+    CHECK(s.suspends == 1 && w.ev_suspended == 2 && !br_a2dp_streaming(&a) && br_a2dp_suspend(&a) == 0);
+    run(&w, &a, &s, 15000);
+    CHECK(s.starts == 2 && w.ev_streaming == 2); /* stays suspended */
+    CHECK(br_a2dp_start(&a) == 1);
+    run(&w, &a, &s, 1000);
+    CHECK(s.starts == 3 && w.ev_streaming == 3 && br_a2dp_streaming(&a) && !w.ev_failed);
     /* S8: the sink reads our SDP record first (in 24-byte pieces): A2DP Source over AVDTP 1.3, then streams */
     g_sdp = 1;
     scenario(0, 1, key, 0, 0, 0, 0, &w, &s, &a);
@@ -448,20 +474,59 @@ void run_a2dp_tests(void)
     uint8_t f[128], sbc[35] = {0x9C};
     const size_t n = br_a2dp_media_frame(&a, 7, 896, sbc, sizeof sbc, 1, f, sizeof f);
     CHECK(n == 4 + 13 + 35 && f[2] == 0x71 && f[4] == 0x80 && f[7] == 7 && f[16] == 1);
-    /* Remote controls stay disabled without disturbing an active media stream. */
+    /* Headset remote controls: the sink opens AVCTP (PSM 0x17); AVRCP pass-through keys reach the application and
+     * are answered with the AVRCP profile ID; the stream itself is only suspended by the application. */
     w.to_sink.head = w.to_sink.tail = 0;
     const int suspended = w.ev_suspended, streams = w.ev_streaming;
     const uint8_t avctp_connect[] = {8, 0, 1, 0, 2, 0x66, 4, 0, 0x17, 0, 0x88, 0};
     br_a2dp_rx(&a, 2, avctp_connect, sizeof avctp_connect);
     msg_t reply;
     CHECK(q_pop(&w.to_sink, &reply) && reply.n == 16);
-    CHECK(reply.d[4] == 3 && reply.d[5] == 0x66 && reply.d[12] == 2 && reply.d[13] == 0);
-    CHECK(br_a2dp_streaming(&a) && !w.ev_failed && w.ev_suspended == suspended);
-    /* Stray play/pause messages on an unaccepted control CID have no effect. */
-    uint8_t control[] = {8, 0, 0x44, 0, 0, 0x11, 0x0e, 0, 0x48, 0x7c, 0x44, 0};
+    CHECK(reply.d[4] == 3 && reply.d[5] == 0x66 && reply.d[8] == 0x44 && reply.d[10] == 0x88 && reply.d[12] == 0);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.d[4] == 4 && reply.d[8] == 0x88); /* our configure request */
+    const uint8_t cfg_rsp[] = {10, 0, 1, 0, 5, reply.d[5], 6, 0, 0x44, 0, 0, 0, 0, 0};
+    br_a2dp_rx(&a, 2, cfg_rsp, sizeof cfg_rsp);
+    const uint8_t cfg_req[] = {8, 0, 1, 0, 4, 0x67, 4, 0, 0x44, 0, 0, 0};
+    br_a2dp_rx(&a, 2, cfg_req, sizeof cfg_req);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.d[4] == 5 && reply.d[5] == 0x67 && reply.d[12] == 0);
+    uint8_t control[] = {8, 0, 0x44, 0, 0x30, 0x11, 0x0e, 0, 0x48, 0x7c, 0x46, 0}; /* PASS THROUGH pause, pressed */
     br_a2dp_rx(&a, 2, control, sizeof control);
-    control[10] = 0x46;
+    CHECK(w.ev_remote == 1 && w.remote.operation == 0x46 && w.remote.pressed == 1);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.n == 12 && reply.d[2] == 0x88);
+    CHECK(reply.d[4] == 0x32 && reply.d[5] == 0x11 && reply.d[6] == 0x0E && reply.d[7] == 0x09 && reply.d[10] == 0x46);
+    control[10] = 0x46 | 0x80; /* released: accepted, no second action */
     br_a2dp_rx(&a, 2, control, sizeof control);
+    CHECK(w.ev_remote == 2 && w.remote.pressed == 0 && q_pop(&w.to_sink, &reply));
     CHECK(br_a2dp_streaming(&a) && !w.ev_failed && w.ev_suspended == suspended && w.ev_streaming == streams);
-    CHECK(w.to_sink.head == w.to_sink.tail);
+    /* play-status notification: INTERIM playing now, CHANGED paused once the stream is suspended */
+    const uint8_t notify[] = {18, 0, 0x44, 0, 0x10, 0x11, 0x0e, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0,
+                              0, 5, 0x01, 0, 0, 0, 0};
+    br_a2dp_rx(&a, 2, notify, sizeof notify);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.d[4] == 0x12 && reply.d[5] == 0x11 && reply.d[7] == 0x0F && reply.d[18] == 0x01);
+    CHECK(br_a2dp_suspend(&a) == 1);
+    run(&w, &a, &s, 500);
+    CHECK(w.ev_suspended == suspended + 1 && s.avrcp_changed == 0x02 && !w.ev_failed);
+    CHECK(br_a2dp_start(&a) == 1);
+    run(&w, &a, &s, 500);
+    CHECK(br_a2dp_streaming(&a) && w.ev_streaming == streams + 1);
+    /* The peer must reserve for task-based payload STOP processing, on all
+     * feature-exchange paths (Core Vol 2 Part C 3.3, bits20..22). */
+    br_a2dp_connected(&a);
+    int got_features_req = 0;
+    while (q_pop(&w.to_sink, &reply)) {
+        if (reply.llid == 3 && reply.d[0] >> 1 == 39) {
+            CHECK(reply.n == 9 && (reply.d[3] & 0x70) == 0x70);
+            got_features_req = 1;
+        }
+    }
+    CHECK(got_features_req);
+    const uint8_t features_req[9] = {39 << 1};
+    br_a2dp_rx(&a, 3, features_req, sizeof features_req);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.llid == 3 && reply.d[0] >> 1 == 40);
+    CHECK(reply.n == 9 && (reply.d[3] & 0x70) == 0x70);
+    const uint8_t extended_req[] = {127 << 1, 3, 0, 1};
+    br_a2dp_rx(&a, 3, extended_req, sizeof extended_req);
+    CHECK(q_pop(&w.to_sink, &reply) && reply.llid == 3 && reply.d[0] >> 1 == 127 && reply.d[1] == 4);
+    CHECK(reply.n == 12 && reply.d[2] == 0 && (reply.d[6] & 0x70) == 0x70);
+
 }

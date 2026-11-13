@@ -9,13 +9,17 @@
 //          a2dp pair (find + pair the first audio device) | a2dp connect [<n saved>] [pair] [beep] | a2dp forget <n>
 //          a2dp stop | a2dp status | a2dp auto <0|1> | a2dp peer <BD_ADDR hex, MSB first>
 //          a2dp key <link key hex, MSB first | clear> (default device) | a2dp tone <Hz | off> | a2dp verbose <0|1>
-// Up to kMaxSaved paired devices (address, link key, name) live in NVS namespace "a2dpn", key "devs", most recently
+//          a2dp rates [clear] (learned SBC sample rate per saved device) | a2dp rate48 <0|1|auto>
+// Up to kMaxSaved paired devices (address, link key, name, learned sample rate) live in NVS namespace "a2dpn", key "devs", most recently
 // used first (older firmware's single "peer"/"key" is migrated).
 
 #include <cstddef>
 #include <cstdint>
 
 namespace a2dp_native {
+
+// True during an automatic reconnect caused by frozen media delivery.
+bool recovering_audio();
 
 void command(const char* line);
 
@@ -34,6 +38,7 @@ struct Device {
 struct Status {
     bool running = false;     // a session is active (searching, setting up, paging, connected, streaming or stopping)
     bool streaming = false;
+    bool connected = false;   // the link is up (streaming, or the stream is suspended/paused)
     bool searching = false;   // the inquiry runs: found[] grows; pair_found() picks one
     bool have_peer = false, have_key = false;  // the default device (saved[0]) and its key
     bool auto_reconnect = false;
@@ -68,6 +73,8 @@ void set_auto(bool on);
 void init();
 // Streaming: PCM written now plays on the headphones.
 bool ready();
+// Request media restart after the link was retained in an audio-paused state.
+void request_resume();
 // Sample rate of the stream (44100 or 48000), 0 when not streaming.
 int rate();
 // Interleaved stereo int16 at rate(). Blocks while more than ~120 ms are queued (paces the producer like the I2S DMA);

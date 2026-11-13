@@ -3,21 +3,23 @@
   "c6_image_sha256": "74e68e89f83238287a2f6858dd4991ee5d51a588363e6219267da78d6c6f7888",
   "c6_image_origin": "Exact parent Tab5 image installed and confirmed on hardware 2026-11-11; matching radio_lab.c, radio_lab.h and br_flow.h included here.",
   "c6_rebuild_check": "Standalone source reconfigured and rebuilt with ESP-IDF 5.5.5 and sdkconfig.release; verify_hooks RESULT: PASS; version 1.4.266. Rebuilt image differs by build metadata.",
-  "p4_source": "This repository, based on 25eebae plus the 2026-11-11 connection and flow-control update; key source hashes below identify the build source.",
-  "p4_build": "ESP-IDF 5.5.5; sdkconfig regenerated from sdkconfig.defaults; idf.py reconfigure build merge-bin, then incremental build merge-bin for final console help.",
-  "p4_app_sha256": "ec80bcca7770249ec6d062362e9da5aff49395aba569fd99b69bb52ea61d2d77",
-  "p4_merged_sha256": "a6cc2ad74218d227e0901ebd410b0001d159e82cb2962c2d24bc8b78d026acfd",
-  "p4_hardware_test": "Not flashed. Same host/radio code tested in parent firmware: latest short H630 transport run stayed connected about 100 seconds with no SBC drops. Long-term media NAK stalls remain unresolved; sustained audible playback not established by that transport check.",
+  "p4_source": "This repository at the 2026-11-13 sync with the parent Tab5 firmware (suspend/resume, AVRCP keys, per-device sample-rate learning); key source hashes below identify the build source.",
+  "p4_build": "ESP-IDF 5.5.5; idf.py build merge-bin. Bootloader, partition table and OTA data unchanged from the previous release.",
+  "p4_app_sha256": "8f62147294d45557114b19499bdb9ca12ed2893c981733a4b1c4d89b607efc0b",
+  "p4_merged_sha256": "61337bf0fc795331459358fc5fbe34856098bf1df64dc06c0cdf29e4d5384e37",
+  "p4_hardware_test": "Standalone image not flashed. The same host, baseband and rate-learning code runs in the parent firmware: the HDB 630 at 48 kHz streamed three 30-minute off-head runs without a stall; the rate-learning switch itself has not yet been exercised on hardware.",
   "idf_version": "5.5.5",
-  "host_validation": "BR 90849 checks; C6 guard, crash and flow-control tests; CIS protocol, crypto and engine tests pass.",
+  "host_validation": "BR 90873 checks; A2DP media-progress and rate-learning tests; C6 sources and image unchanged since 1.4.266.",
   "source_sha256": {
     "main/Kconfig.projbuild": "709ebfcabdcb90c8fde5ee3074f475fb7b8bb86ea243d6c3025584fffff1f24d",
-    "main/main.cpp": "603e1101bd977f8329395e4c8a6c229d21c38c29d544d8a7b96b181a044eafb7",
-    "main/bt/a2dp_native.cpp": "3d719e2dd8ac60cca2c7e42168feb58fbb1d5d4da9902d4995100e49d33df6cc",
+    "main/main.cpp": "f221bfdf517c85b9d61d2e4d6c14f2349d3c655128c245452068228747d2f32a",
+    "main/bt/a2dp_native.cpp": "2877edc6b241e4e5feea51db6fb0976274b4aa42d0eb541a95e4524fc7421963",
     "main/bt/radio_lab.cpp": "ca99ca3ff1456dcb3bac8777ea337546328b62901395cc647eb1f7dce6202497",
-    "components/br_baseband/src/br_a2dp_src.c": "065d081ab1396b5951a06186060253bf8a12fa8fc9a1956198a6bbc89051b7e2",
+    "components/br_baseband/src/br_a2dp_src.c": "ee2608703e25fac06d551229bb03ece3e7ecea98c9e35f8b55df399a31aa6eef",
     "c6_fw/c6_firmware/main/radio_lab.c": "8266a7330525824291ced2db754254862ad64f77459f54758d0076723919e01a",
     "c6_fw/c6_firmware/main/br_flow.h": "371a1866fca7a5e1d9137d8b646ebdd287388e9fd06656640e844d7f15631a69",
-    "c6_fw/c6_firmware/main/coprocessor_fw_version.txt": "e7a2fed95c45dc23809dad74b4a80dfb79e02c403bcc105834efc31d7874b23f"
+    "c6_fw/c6_firmware/main/coprocessor_fw_version.txt": "e7a2fed95c45dc23809dad74b4a80dfb79e02c403bcc105834efc31d7874b23f",
+    "main/bt/a2dp_rate.h": "d6c30018b81d55933c728dbd7a13ced71f04ad2868a73d51a8dc75fa6c6eaca0",
+    "main/ui.cpp": "51c658bff6e7d221cdada19cad765bd7b2c6430a47356ad89adae4ea8462abc4"
   }
 }

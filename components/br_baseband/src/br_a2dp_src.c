@@ -1,6 +1,7 @@
 #include "br/br_a2dp_src.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,10 +33,14 @@ static const uint8_t kSilent[] = {OP_NAME_RES, OP_ACCEPTED, OP_NOT_ACCEPTED, OP_
                                   52 /* slot_offset */, 55 /* supervision_timeout */, 60 /* set_afh */};
 
 /* Page 0: encryption, SSP (controller), encapsulated PDU, extended features. 1-slot BR ACL only. */
-static const uint8_t kFeatures0[8] = {0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x80};
+/* Core Vol 2 Part C 3.3 / Part B 6.6.2: bits20..22 encode STOP lag
+ * in 256-byte units. CRC verification is task-based, so zero lag is false.
+ * Advertise the conservative 1792-byte allowance (64 queued DH1 fragments
+ * plus one in flight fit in it); do not claim instantaneous payload STOP. */
+static const uint8_t kFeatures0[8] = {0x04, 0x00, 0x70, 0x00, 0x00, 0x00, 0x18, 0x80};
 static const uint8_t kFeatures1[8] = {0x01, 0, 0, 0, 0, 0, 0, 0}; /* SSP host support */
-/* What the lab sent in its first LMP_features_req (kept: the Bose accepted it every time). */
-static const uint8_t kFeaturesReq[8] = {0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00};
+/* Initial feature request uses the same flow-control lag as our responses. */
+static const uint8_t kFeaturesReq[8] = {0x04, 0x00, 0x70, 0x00, 0x00, 0x00, 0x08, 0x00};
 static const uint8_t kIocap[3] = {0x03, 0x00, 0x04}; /* NoInputNoOutput, no OOB, MITM not required + bonding */
 
 enum { SSP_IDLE, SSP_IOCAP, SSP_KEY_HDR, SSP_KEY_PL, SSP_PEER_KEY, SSP_WAIT_CONFIRM, SSP_WAIT_NUMBER, SSP_WAIT_DHKEY,
@@ -44,16 +49,18 @@ enum { AU_IDLE, AU_RAND, AU_ENC_MODE, AU_KEY_SIZE, AU_START_ENC, AU_ENCRYPTED, A
 enum { L2_OFF, L2_WAIT_SINK, L2_SIG_CONNECTING, L2_SIGNALING, L2_SIGNALING_ACP, L2_MEDIA_CONNECTING, L2_STARTING,
        L2_STREAMING };
 enum { AV_IDLE, AV_DISCOVER, AV_CAPS, AV_CONFIGURE, AV_OPEN, AV_CONFIGURED, AV_NEED_MEDIA, AV_STARTING, AV_STREAMING,
-       AV_FAIL };
+       AV_FAIL, AV_SUSPENDING };
 
 #define PSM_AVDTP 0x0019
 #define SIG_SCID 0x0041
 #define MEDIA_SCID 0x0042
 #define SDP_SCID 0x0043
 #define PSM_SDP 0x0001
-#define PSM_AVCTP 0x0017 /* Remote play/pause controls remain disabled by user preference. */
+#define PSM_AVCTP 0x0017
 #define OUR_MTU 672
 #define INT_SEID 1
+#define AVCTP_CID 0x0044
+#define AVCTP_PID_AVRCP 0x110E
 
 static void a2_log(br_a2dp_t* a, const char* fmt, ...)
 {
@@ -142,6 +149,7 @@ static br_a2dp_ch_t* ch_by_scid(br_a2dp_t* a, uint16_t scid)
     if (a->sig.used && a->sig.scid == scid) return &a->sig;
     if (a->media.used && a->media.scid == scid) return &a->media;
     if (a->sdp.used && a->sdp.scid == scid) return &a->sdp;
+    if (a->avctp.used && a->avctp.scid == scid) return &a->avctp;
     return NULL;
 }
 
@@ -361,7 +369,7 @@ static int sbc_from_ie(const uint8_t* ie, size_t n, br_a2dp_stream_t* s)
 static void choose_config(br_a2dp_t* a, const uint8_t* cap)
 {
     const uint8_t o0 = cap[2], o1 = cap[3];
-    const uint8_t f = (o0 & 0x20) ? 0x20 : (o0 & 0x10) ? 0x10 : (o0 & 0x40) ? 0x40 : 0x80;
+    const uint8_t f = (a->cfg.prefer_48k && (o0 & 0x10)) ? 0x10 : (o0 & 0x20) ? 0x20 : (o0 & 0x10) ? 0x10 : (o0 & 0x40) ? 0x40 : 0x80;
     const uint8_t m = (o0 & 0x01) ? 0x01 : (o0 & 0x02) ? 0x02 : (o0 & 0x04) ? 0x04 : 0x08;
     const uint8_t b = (o1 & 0x10) ? 0x10 : (o1 & 0x20) ? 0x20 : (o1 & 0x40) ? 0x40 : 0x80;
     const uint8_t sb = (o1 & 0x04) ? 0x04 : 0x08;
@@ -386,6 +394,7 @@ static const uint8_t* find_cat(const uint8_t* p, size_t n, uint8_t cat, size_t* 
 }
 
 static void l2_progress(br_a2dp_t* a);
+static void avrcp_play_changed(br_a2dp_t* a);
 
 static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
 {
@@ -449,9 +458,10 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
             if (signal != SIG_SUSPEND) a->have_config = 0;
             a->av_state = signal == SIG_SUSPEND ? AV_CONFIGURED : AV_IDLE;
             a->resuming = 0;
-            a->resume_at = signal == SIG_SUSPEND ? now(a) + 2000u : 0;  /* a source restarts its stream (AVDTP 8.15) */
+            a->resume_at = 0;  /* the sink paused: stay suspended until it or the application starts the stream */
             if (a->l2_state == L2_STREAMING) a->l2_state = L2_SIGNALING;
             if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_SUSPENDED, NULL);
+            avrcp_play_changed(a);
             return;
         case SIG_GET_CONFIG:
             if (a->have_config && pn && (p[0] >> 2) == INT_SEID) {
@@ -471,11 +481,18 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
     }
     if (msg != AV_ACCEPT) {
         if (signal == SIG_START && a->av_state == AV_STREAMING) return;
-        if (signal == SIG_START && a->resuming) {  /* still busy (a call, another source): try again later */
+        if (signal == SIG_START && a->resuming) {  /* still busy (a call, another source): stays suspended */
             a->resuming = 0;
             a->av_state = AV_CONFIGURED;
             a->l2_state = L2_SIGNALING;
-            a->resume_at = now(a) + 10000u;
+            a->resume_at = 0;
+            a2_log(a, "AVDTP: the sink refused START; stream stays suspended");
+            if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_SUSPENDED, NULL);
+            return;
+        }
+        if (signal == SIG_SUSPEND && a->av_state == AV_SUSPENDING) {  /* refused: the stream is still open */
+            a->av_state = AV_STREAMING;
+            l2_progress(a);
             return;
         }
         if (signal == SIG_GET_CAPS && a->av_state == AV_CAPS && a->sep_i + 1u < a->sep_n) {
@@ -518,6 +535,14 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
             fail(a, "sink has no SBC");
             return;
         }
+        {   /* the sink's full capability list for this endpoint, for diagnosis */
+            char dump[2 * 40 + 1];
+            const char* digits = "0123456789ABCDEF";
+            const size_t dn = pn < 40 ? pn : 40;
+            for (size_t i = 0; i < dn; ++i) { dump[2 * i] = digits[p[i] >> 4]; dump[2 * i + 1] = digits[p[i] & 15]; }
+            dump[2 * dn] = 0;
+            a2_log(a, "AVDTP: sink endpoint %u capabilities %s", a->sink_seid, dump);
+        }
         choose_config(a, codec);
         a->av_state = AV_CONFIGURE;
         uint8_t c[2 + 2 + 2 + 6];
@@ -535,6 +560,13 @@ static void av_on_signal(br_a2dp_t* a, const uint8_t* m, size_t n)
     } else if (signal == SIG_START && a->av_state == AV_STARTING) {
         a->av_state = AV_STREAMING;
         l2_progress(a);
+    } else if (signal == SIG_SUSPEND && a->av_state == AV_SUSPENDING) {
+        a->av_state = AV_CONFIGURED;
+        a->resuming = 0;
+        a->resume_at = 0;
+        a2_log(a, "AVDTP: stream suspended");
+        if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_SUSPENDED, NULL);
+        avrcp_play_changed(a);
     }
 }
 
@@ -571,6 +603,7 @@ static void l2_progress(br_a2dp_t* a)
         a->stream.media_mtu = a->media.peer_mtu;
         a2_log(a, "AVDTP: streaming, media CID 0x%04X MTU %u", a->media.dcid, a->media.peer_mtu);
         if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_STREAMING, &a->stream);
+        avrcp_play_changed(a);
     }
 }
 
@@ -589,6 +622,7 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             if (psm == PSM_AVDTP && !a->sig.used) { c = &a->sig; mine = SIG_SCID; }
             else if (psm == PSM_AVDTP && !a->media.used && a->av_state == AV_NEED_MEDIA) { c = &a->media; mine = MEDIA_SCID; }
             else if (psm == PSM_SDP && !a->sdp.used) { c = &a->sdp; mine = SDP_SCID; }
+            else if (psm == PSM_AVCTP && !a->avctp.used) { c = &a->avctp; mine = AVCTP_CID; }
             uint8_t r[8];
             if (!c) {
                 put16(r, 0); put16(r + 2, scid); put16(r + 4, psm == PSM_AVDTP ? 0x0004 : 0x0002); put16(r + 6, 0);
@@ -599,12 +633,15 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             }
             memset(c, 0, sizeof *c);
             c->used = 1; c->incoming = 1; c->scid = mine; c->dcid = scid; c->peer_mtu = 672;
-            if (c != &a->sdp && a->l2_state == L2_OFF) { a->l2_state = L2_WAIT_SINK; a->t_l2_start = now(a); }
+            if ((c == &a->sig || c == &a->media) && a->l2_state == L2_OFF) {
+                a->l2_state = L2_WAIT_SINK; a->t_l2_start = now(a);
+            }
             if (c == &a->media) a->l2_state = L2_MEDIA_CONNECTING;
             put16(r, mine); put16(r + 2, scid); put16(r + 4, 0); put16(r + 6, 0);
             sig(a, 0x03, ident, r, 8);
             ch_cfg_req(a, scid);
-            a2_log(a, "L2CAP: accepted incoming %s channel -> 0x%04X", psm == PSM_SDP ? "SDP" : "AVDTP", mine);
+            a2_log(a, "L2CAP: accepted incoming %s channel -> 0x%04X",
+                   psm == PSM_SDP ? "SDP" : psm == PSM_AVCTP ? "AVCTP" : "AVDTP", mine);
         } else if (code == 0x03 && len >= 8) { /* connection response */
             br_a2dp_ch_t* c = ch_by_scid(a, get16(d + 2));
             const uint16_t result = get16(d + 4);
@@ -652,10 +689,119 @@ static void l2_on_signaling(br_a2dp_t* a, const uint8_t* p, size_t n)
             }
         }
     }
-    br_a2dp_ch_t* cs[3] = {&a->sig, &a->media, &a->sdp};
-    for (int k = 0; k < 3; ++k)
+    br_a2dp_ch_t* cs[4] = {&a->sig, &a->media, &a->sdp, &a->avctp};
+    for (int k = 0; k < 4; ++k)
         if (cs[k]->used && cs[k]->cfg_in && cs[k]->cfg_out && !cs[k]->up && cs[k]->dcid) cs[k]->up = 1;
     l2_progress(a);
+}
+
+/* AVRCP play status: 0x01 playing while the AVDTP stream is started, 0x02 paused otherwise. */
+static uint8_t avrcp_play_status(const br_a2dp_t* a) { return a->av_state == AV_STREAMING ? 0x01 : 0x02; }
+
+/* Completes a registered EVENT_PLAYBACK_STATUS_CHANGED notification (AVRCP 6.7.2): one CHANGED response, then the
+ * controller registers again. */
+static void avrcp_play_changed(br_a2dp_t* a)
+{
+    if (!a->avrcp_notify || !a->avctp.used || !a->avctp.up) return;
+    a->avrcp_notify = 0;
+    const uint8_t out[15] = {(uint8_t)(a->avrcp_notify_tid | 0x02), AVCTP_PID_AVRCP >> 8, AVCTP_PID_AVRCP & 0xFF,
+                             0x0D /* CHANGED */, a->avrcp_notify_subunit, 0x00, 0x00, 0x19, 0x58, 0x31, 0, 0, 2,
+                             0x01, avrcp_play_status(a)};
+    l2_send(a, a->avctp.dcid, out, sizeof out);
+    a2_log(a, "AVRCP: play status changed -> %s", out[14] == 0x01 ? "playing" : "paused");
+}
+
+/* AVCTP single-packet transport and the small AVRCP target surface used by headset controls. */
+static void avctp_on(br_a2dp_t* a, const uint8_t* p, size_t n)
+{
+    if (n < 3) return;
+    const uint8_t avctp = p[0];
+    const uint8_t tid = avctp & 0xF0;
+    const uint8_t packet_type = (avctp >> 2) & 0x03;
+    const bool command = (avctp & 0x02) == 0;
+    if (!command) return;
+    if (packet_type != 0) {
+        a2_log(a, "AVCTP: unsupported fragmented packet type %u", packet_type);
+        return;
+    }
+    const uint16_t pid = (uint16_t)((uint16_t)p[1] << 8 | p[2]);
+    uint8_t out[260] = {(uint8_t)(tid | 0x02), AVCTP_PID_AVRCP >> 8, AVCTP_PID_AVRCP & 0xFF};
+    size_t out_len = 3;
+    if (pid != AVCTP_PID_AVRCP) {
+        out[0] |= 0x01; /* invalid profile identifier */
+        out[1] = p[1]; out[2] = p[2];
+        l2_send(a, a->avctp.dcid, out, out_len);
+        a2_log(a, "AVCTP: rejected PID 0x%04X", pid);
+        return;
+    }
+    if (n < 6 || n - 3 > sizeof(out) - 3) return; /* AV/C header is three octets */
+    const uint8_t* avc = p + 3;
+    const size_t avc_len = n - 3;
+    uint8_t* rsp = out + 3;
+    if (avc[2] == 0x7C && avc_len >= 5) { /* PASS THROUGH */
+        const uint8_t op = avc[3] & 0x7F;
+        const bool supported = op == 0x44 || op == 0x45 || op == 0x46 || op == 0x4B || op == 0x4C;
+        rsp[0] = supported ? 0x09 : 0x08; /* ACCEPTED / NOT IMPLEMENTED */
+        memcpy(rsp + 1, avc + 1, avc_len - 1);
+        out_len += avc_len;
+        if (supported) {
+            const br_a2dp_remote_t event = {op, (uint8_t)((avc[3] & 0x80) == 0)};
+            a2_log(a, "AVRCP: operation 0x%02X %s", op, event.pressed ? "pressed" : "released");
+            if (a->io.event) a->io.event(a->io.ctx, BR_A2DP_EV_REMOTE, &event);
+        } else a2_log(a, "AVRCP: unsupported pass-through operation 0x%02X", op);
+    } else if (avc[2] == 0x30 && avc_len >= 3) { /* UNIT INFO */
+        rsp[0] = 0x0C; rsp[1] = 0x07; rsp[2] = 0x30; rsp[3] = 0xFF;
+        rsp[4] = 0x00; rsp[5] = 0xFF; rsp[6] = 0xFF;
+        out_len = 10;
+    } else if (avc[2] == 0x31 && avc_len >= 3) { /* SUBUNIT INFO: one panel subunit */
+        rsp[0] = 0x0C; rsp[1] = avc[1]; rsp[2] = 0x31; rsp[3] = 0x48;
+        memset(rsp + 4, 0xFF, 4);
+        out_len = 11;
+    } else if (avc[2] == 0x00 && avc_len >= 11 && avc[6] == 0x10 && avc[7] == 0 &&
+               avc[8] == 0 && avc[9] == 1) { /* AVRCP GetCapabilities */
+        const uint8_t cap = avc[10];
+        rsp[0] = 0x0C; rsp[1] = avc[1]; rsp[2] = 0x00;
+        memcpy(rsp + 3, avc + 3, 4); /* Company ID and PDU ID */
+        rsp[7] = 0; /* single response packet */
+        if (cap == 0x02) { /* company IDs: Bluetooth SIG */
+            rsp[8] = 0; rsp[9] = 4;
+            rsp[10] = cap; rsp[11] = 1; rsp[12] = 0x00; rsp[13] = 0x19; rsp[14] = 0x58;
+            out_len = 18;
+        } else if (cap == 0x03) { /* play-status-change notification */
+            rsp[8] = 0; rsp[9] = 3;
+            rsp[10] = cap; rsp[11] = 1; rsp[12] = 0x01;
+            out_len = 16;
+        } else {
+            rsp[0] = 0x0A; /* REJECTED */
+            rsp[7] = 0; rsp[8] = 0; rsp[9] = 1; rsp[10] = 0x01;
+            out_len = 14;
+        }
+        a2_log(a, "AVRCP: GetCapabilities 0x%02X", cap);
+    } else if (avc[2] == 0x00 && avc_len >= 15 && avc[6] == 0x31 && avc[7] == 0 &&
+               avc[8] == 0 && avc[9] == 5 && avc[10] == 0x01) { /* RegisterNotification: play status */
+        rsp[0] = 0x0F; rsp[1] = avc[1]; rsp[2] = 0x00;
+        memcpy(rsp + 3, avc + 3, 4); /* Company ID and PDU ID */
+        rsp[7] = 0; rsp[8] = 0; rsp[9] = 2;
+        rsp[10] = 0x01; /* event: play status changed */
+        rsp[11] = avrcp_play_status(a);
+        out_len = 15;
+        a->avrcp_notify = 1;
+        a->avrcp_notify_tid = tid;
+        a->avrcp_notify_subunit = avc[1];
+        a2_log(a, "AVRCP: play-status notification registered (%s)",
+               rsp[11] == 0x01 ? "playing" : "paused");
+    } else {
+        rsp[0] = 0x08; /* NOT IMPLEMENTED */
+        memcpy(rsp + 1, avc + 1, avc_len - 1);
+        out_len += avc_len;
+        char dump[65];
+        const char* digits = "0123456789ABCDEF";
+        const size_t dump_n = avc_len < 32 ? avc_len : 32;
+        for (size_t i = 0; i < dump_n; ++i) { dump[2 * i] = digits[avc[i] >> 4]; dump[2 * i + 1] = digits[avc[i] & 0x0F]; }
+        dump[2 * dump_n] = 0;
+        a2_log(a, "AVRCP: unsupported opcode 0x%02X data %s", avc[2], dump);
+    }
+    l2_send(a, a->avctp.dcid, out, out_len);
 }
 
 static void l2_on_frame(br_a2dp_t* a, uint16_t cid, const uint8_t* p, size_t n)
@@ -663,6 +809,7 @@ static void l2_on_frame(br_a2dp_t* a, uint16_t cid, const uint8_t* p, size_t n)
     if (cid == 0x0001) l2_on_signaling(a, p, n);
     else if (a->sig.used && cid == a->sig.scid) av_on_signal(a, p, n);
     else if (a->sdp.used && a->sdp.up && cid == a->sdp.scid) sdp_on(a, p, n);
+    else if (a->avctp.used && a->avctp.up && cid == a->avctp.scid) avctp_on(a, p, n);
 }
 
 static void l2_start(br_a2dp_t* a)
@@ -1041,6 +1188,32 @@ void br_a2dp_poll(br_a2dp_t* a)
 void br_a2dp_detach(br_a2dp_t* a, uint8_t reason) { lmp(a, OP_DETACH, 0, &reason, 1); }
 
 int br_a2dp_streaming(const br_a2dp_t* a) { return a->l2_state == L2_STREAMING; }
+
+int br_a2dp_suspend(br_a2dp_t* a)
+{
+    /* called again while the SUSPEND is unanswered: send it again (the caller flushed a blocked link) */
+    if (a->av_state != AV_SUSPENDING && (a->av_state != AV_STREAMING || a->l2_state != L2_STREAMING)) return 0;
+    if (!a->sig.up) return 0;
+    a->av_state = AV_SUSPENDING;
+    a->l2_state = L2_SIGNALING;
+    const uint8_t s = (uint8_t)(a->sink_seid << 2);
+    av_cmd(a, SIG_SUSPEND, &s, 1);
+    return 1;
+}
+
+int br_a2dp_start(br_a2dp_t* a)
+{
+    if (a->av_state == AV_STREAMING || a->av_state == AV_STARTING) return 1;
+    if (a->av_state != AV_CONFIGURED || !a->have_config || !a->media.up || !a->sig.up) return 0;
+    a->resume_at = 0;
+    a->resuming = 1;
+    a->av_state = AV_STARTING;
+    a->l2_state = L2_STARTING;
+    a2_log(a, "AVDTP: starting the suspended stream");
+    const uint8_t s = (uint8_t)(a->sink_seid << 2);
+    av_cmd(a, SIG_START, &s, 1);
+    return 1;
+}
 
 size_t br_a2dp_media_frame(const br_a2dp_t* a, uint16_t seq, uint32_t ts, const uint8_t* sbc, size_t sbc_len,
                            uint8_t n_frames, uint8_t* out, size_t cap)

@@ -1,5 +1,6 @@
 #include "bt/a2dp_native.h"
 #include "bt/a2dp_progress.h"
+#include "bt/a2dp_rate.h"
 
 #include <algorithm>
 #include <atomic>
@@ -38,9 +39,17 @@ constexpr const char* kNs = "a2dpn";
 constexpr uint32_t kOwnLap = 0x22CA1B;
 constexpr uint8_t kOwnUap = 0x00;
 constexpr uint8_t kOwnAddr[6] = {0x1B, 0xCA, 0x22, 0x00, 0x00, 0x00};
-constexpr int kFramesPerPacket = 15;  // the SBC payload header allows 15: least L2CAP/RTP overhead
-constexpr uint8_t kMaxBitpool = 20;     // our SEP; the link budget is one DH1 per central slot
-constexpr uint8_t kStreamBitpool = 14;  // 41-byte frames: 15 per packet = 24 DH1 per 43.5 ms, ~69 % of TX slots
+int kFramesPerPacket = 15;  // the SBC payload header allows 15: least L2CAP/RTP overhead (console: a2dp fpp <n>)
+uint8_t kMaxBitpool = 20;     // our SEP; the link budget is one DH1 per central slot (console: a2dp maxbp <n>)
+// SBC sample rate: -1 = automatic (learned per device, see a2dp_rate.h; the first guess is prefers_48k()),
+// 0 = 44.1 kHz, 1 = 48 kHz when offered (both fixed settings turn learning off). Console: a2dp rate48 <0|1|auto>.
+int rate48_mode = -1;
+// First guess for the learned rate. Interop: the Sennheiser HDB 630 stops accepting media after seconds to minutes
+// of 44.1 kHz SBC (its data path shuts and its own prompts go silent until the link closes); at 48 kHz it ran 33 min
+// over six runs without a stall where 44.1 kHz stalled in five of six (TROUBLESHOOTING.md §3.11). Matched by
+// Sennheiser's OUI 80:C3:BA. Other devices with the same problem are found by learning.
+bool prefers_48k(const uint8_t* peer /* LSB first */) { return peer[5] == 0x80 && peer[4] == 0xC3 && peer[3] == 0xBA; }
+constexpr uint8_t kStreamBitpool = 14;  // target quality after the link proves it can sustain clean media ACKs
 
 enum class State : uint8_t { Idle, Setup, Paging, Connected, Streaming, Stopping };
 // Connect: a saved device with its key. Pair: one address, fresh pairing. Search: list discoverable devices until
@@ -73,8 +82,18 @@ struct Session {
     uint8_t kc[16] = {};
     uint32_t log_seen = 0, entries0 = 0;
     bool connected = false;
+    std::atomic<bool> media_paused{false};  // preserve ACL/AVCTP link after an H630 media-ACK stall
+    std::atomic<bool> resume_requested{false};
+    std::atomic<bool> remote_play_pending{false};
+    // AVDTP stream suspended with the link up: by the headset (sink_paused: its pause key, wear detection or an
+    // AVDTP SUSPEND) or by us when nothing has played for a few seconds. No media is sent until it is started again.
+    std::atomic<bool> suspended{false};
+    std::atomic<bool> sink_paused{false};
+    std::atomic<bool> suspend_requested{false};
+    bool suspend_local = false;  // worker only: the next BR_A2DP_EV_SUSPENDED answers our own SUSPEND
     uint8_t detach_reason = 0;  // the sink's LMP_detach reason (0 = none)
     br_a2dp_stream_t stream = {};
+    bool asked48 = false;  // this connection asked the sink for 48 kHz
     char status[96] = "idle";
 };
 
@@ -98,15 +117,41 @@ std::atomic<bool> quality_start{false};
 // A sink that still holds our previous link (its supervision timeout, up to 20 s, has not run out, e.g. our LMP detach
 // got lost on a poor link) refuses the next one with 0x0B "connection already exists": wait and try again.
 std::atomic<int> stale_left{0};
+// The learned sample rate changed after a media stall: reconnect the same device at the new rate at this time (us).
+std::atomic<int64_t> rate_switch_at{0};
 // Adaptive bitpool: with one-slot packets, bitpool 14 needs ~69 % of all central slots. When the peer misses replies
 // (a receiver sharing its radio with its own BLE links: 25-40 % for minutes) the stream would fall behind and break up,
 // so the encoder steps down (14 -> 12 -> 10 -> 8, ~55 % of slots at 10) and back up after 5 clean seconds.
-constexpr int kMinBitpool = 8;
+// Floor and starting point of the adaptive bitpool (console: a2dp minbp <n>). 8 is the floor the adaptation was designed
+// around (14/12/10/8, soaked at 41 % missed replies). It was dropped to 2 on 2026-11-12 as an attempt to outlast the
+// H630 stall; that stall turned out to depend on the sample rate (see prefers_48k), and bitpool 2 is barely audio.
+int kMinBitpool = 8;
 std::atomic<int> stream_bitpool{14};
 std::atomic<bool> auto_on{false}, user_stop{false};
+std::atomic<bool> audio_recovering{false};
+// Idle suspend: a started stream with no PCM for this long is suspended (a headset that is not playing, e.g. taken
+// off, stops accepting media; pouring silence into it stalls the link).
+constexpr int64_t kIdleSuspendUs = 3 * 1000000LL;
+std::atomic<int64_t> last_pcm_us{0};
+// Diagnostic: media rate offset in ppm against real time (console: a2dp pace <ppm>). 0 = exactly real time.
+std::atomic<int> pace_ppm{0};
+// Diagnostic: one delivery gap (console: a2dp gap <ms> [drop]). The encoder stops for that long; afterwards it either
+// catches up in a burst (default, what a radio fade does) or drops the missed audio and continues at real time.
+std::atomic<int> gap_ms{0};
+std::atomic<bool> gap_drop{false};
 // NVS state cached for status() (the UI polls it)
 bool verbose = false;
 int tone_hz = 0;
+// The demo's audio source is the test tone. The headset's keys pause and resume it (the full Tab5 firmware drives
+// its music player here instead).
+namespace source {
+int paused_hz = 0;
+void play() { if (!tone_hz && paused_hz) { tone_hz = paused_hz; paused_hz = 0; } }
+void pause() { if (tone_hz) { paused_hz = tone_hz; tone_hz = 0; } }
+void stop() { pause(); }
+void next_track() {}
+void previous_track() {}
+}  // namespace source
 std::atomic<bool> dump_sbc{false};
 
 // PCM ring (interleaved stereo int16) between write_pcm() and the encoder task
@@ -147,7 +192,8 @@ void nvs_put(const char* k, const uint8_t* v, size_t n) {
 struct Saved {
     uint8_t addr[6];  // LSB first
     uint8_t key[16];
-    uint8_t has_key, rsvd;
+    uint8_t has_key;
+    uint8_t rate;  // learned SBC sample rate (a2dp_rate.h); was zero padding in older firmware
     uint32_t cod;
     char name[BR_A2DP_NAME_MAX + 1];
 };
@@ -216,6 +262,27 @@ void saved_upsert(const uint8_t* addr, const uint8_t* key, uint32_t cod, const c
     saved_to_front(i);
     saved_store();
 }
+// Learned rate byte of a saved device (0 = untested / not saved).
+uint8_t saved_rate(const uint8_t* addr) {
+    SavedLock l;
+    const int i = saved_find(addr);
+    return i < 0 ? 0 : saved_list[i].rate;
+}
+void saved_set_rate(const uint8_t* addr, uint8_t rate) {
+    SavedLock l;
+    const int i = saved_find(addr);
+    if (i < 0 || saved_list[i].rate == rate) return;
+    saved_list[i].rate = rate;
+    saved_store();
+}
+const char* rate_choice_name(uint8_t b) {
+    switch (rate_choice(b)) {
+    case kRate44: return "44.1 kHz (learned)";
+    case kRate48: return "48 kHz (learned)";
+    case kRateSettled: return "first guess (both rates stalled)";
+    default: return "first guess";
+    }
+}
 
 void fmt_addr(char* out, size_t n, const uint8_t* a) {
     std::snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
@@ -273,9 +340,19 @@ void hex(char* dst, const uint8_t* v, size_t n) {
 struct Connq {
     uint8_t state = 0;
     uint32_t n = 0, entries = 0, count = 0, head = 0, tail = 0, acked = 0, sbc_level = 0, tx = 0, noreply = 0, sbc_drops = 0;
+    uint32_t fifo_tx = 0, retx = 0, rx_nak = 0, rx_ack = 0, rx_hecfail = 0, rx_verified = 0, rx_verify_fail = 0, rx_dup = 0;
+    uint32_t rx_noreply = 0, flow_stops = 0, flow_goes = 0, flow_blocked = 0;
     bool ok = false, have_acked = false, have_flow = false, payload_go = false;
     uint8_t next_seqn = 0;
 };
+
+// Keep the rolling diagnostic history out of the a2dp_native task's small stack.
+struct StallSample { int64_t at = 0; Connq q; };
+constexpr size_t kStallHistorySamples = 32;
+StallSample stall_history[kStallHistorySamples];
+size_t stall_history_next = 0, stall_history_count = 0;
+int64_t stall_history_at = 0;
+
 Connq connq() {
     Connq q;
     uint8_t b[240];
@@ -290,8 +367,15 @@ Connq connq() {
     if (n >= 101) { q.head = u32(93); q.tail = u32(97); }
     if (n >= 113) { q.acked = u32(109); q.have_acked = true; }
     if (n >= 145) q.noreply = u32(141);
+    if (n >= 165) {
+        q.fifo_tx = u32(101); q.retx = u32(105); q.rx_nak = u32(117); q.rx_ack = u32(121); q.rx_hecfail = u32(125);
+        q.rx_verified = u32(129); q.rx_verify_fail = u32(133); q.rx_dup = u32(137); q.rx_noreply = u32(141);
+    }
     if (n >= 205) { q.sbc_level = u32(193); q.sbc_drops = u32(197); }
-    if (n >= 227) { q.have_flow = true; q.payload_go = b[226] != 0; q.next_seqn = b[162] & 1u; }
+    if (n >= 227) {
+        q.have_flow = true; q.payload_go = b[226] != 0; q.next_seqn = b[162] & 1u;
+        q.flow_stops = u32(214); q.flow_goes = u32(218); q.flow_blocked = u32(222);
+    }
     q.ok = true;
     return q;
 }
@@ -356,8 +440,33 @@ void io_event(void*, int ev, const void* arg) {
         }
         break;
     }
+    case BR_A2DP_EV_REMOTE: {
+        const auto& key = *static_cast<const br_a2dp_remote_t*>(arg);
+        if (!key.pressed) break;
+        std::printf("A2DP headphone key 0x%02X\n", key.operation);
+        if (key.operation == 0x44 && (s->media_paused || s->suspended) && s->connected) {
+            s->sink_paused = false;
+            s->resume_requested = true;
+            s->remote_play_pending = true;
+            break;
+        }
+        switch (key.operation) {
+        case 0x44: source::play(); break;           // play
+        case 0x45:                                // stop
+        case 0x46:                                // pause: stop the source and suspend the stream
+            if (key.operation == 0x45) source::stop(); else source::pause();
+            s->sink_paused = true;
+            s->suspend_requested = true;
+            break;
+        case 0x4B: source::next_track(); break;     // forward
+        case 0x4C: source::previous_track(); break; // backward
+        default: break;
+        }
+        break;
+    }
     case BR_A2DP_EV_ENCRYPTED: set_status("encrypted"); break;
     case BR_A2DP_EV_STREAMING: {
+        audio_recovering = false;
         s->stream = *static_cast<const br_a2dp_stream_t*>(arg);
         lab(l2_dm1 ? "lab page dm1 1" : "lab page dm1 0");
         { char fl[32]; std::snprintf(fl, sizeof fl, "lab page frag %d", l2_frag); lab(fl); }
@@ -365,7 +474,11 @@ void io_event(void*, int ev, const void* arg) {
         if (s->beep) std::snprintf(line, sizeof line, "lab page stream 1 %04X %d 0", s->stream.media_cid, kFramesPerPacket);
         else std::snprintf(line, sizeof line, "lab page stream 2 %04X %d 0", s->stream.media_cid, kFramesPerPacket);
         lab(line);
+        last_pcm_us = esp_timer_get_time();
         s->state = State::Streaming;
+        s->suspended = false;
+        s->sink_paused = false;
+        s->suspend_local = false;
         reconnect_left = 0;
         {  // the device that plays becomes the default (auto-reconnect target)
             SavedLock l;
@@ -374,6 +487,7 @@ void io_event(void*, int ev, const void* arg) {
         }
         set_status("streaming SBC %lu Hz, bitpool <= %u%s", static_cast<unsigned long>(s->stream.freq),
                    s->stream.max_bitpool, s->beep ? " (C6 beep test)" : "");
+        if (s->remote_play_pending.exchange(false)) source::play();
         break;
     }
     case BR_A2DP_EV_FAILED:
@@ -386,13 +500,20 @@ void io_event(void*, int ev, const void* arg) {
         s->stop = true;
         break;
     case BR_A2DP_EV_SUSPENDED:
-        // no media while suspended (AVDTP): the C6 stops sending, the encoder ends; the engine sends START again
-        // and BR_A2DP_EV_STREAMING re-arms both
+        // No media while suspended (AVDTP): the C6 stops sending and the encoder ends. The stream stays suspended
+        // until the headset starts it, its play key arrives, or something local plays (request_resume / write_pcm);
+        // BR_A2DP_EV_STREAMING re-arms both.
         if (s->state == State::Streaming) {
             lab("lab page stream 0 0 1 0");
             s->state = State::Connected;
         }
-        set_status("headphones paused the stream: restarting");
+        if (!s->suspend_local) {  // the headset's own SUSPEND: it paused, so pause the source too
+            s->sink_paused = true;
+            source::pause();
+        }
+        s->suspend_local = false;
+        s->suspended = true;
+        set_status(s->sink_paused ? "connected; paused by the headphones" : "connected; idle (stream suspended)");
         break;
     default: break;
     }
@@ -443,7 +564,8 @@ void feed_log_entry(const uint8_t* e, size_t n) {
 // ---- SBC encoder task -------------------------------------------------------------------------------------------
 uint32_t ring_level() { return ring_w.load() - ring_r.load(); }
 
-void encoder_task(void*) {
+// One run of the encoder: from the stream starting until it stops or is suspended.
+void encoder_run() {
     static SBC_ENC_PARAMS enc;
     std::memset(&enc, 0, sizeof enc);
     const br_a2dp_stream_t& st = s->stream;
@@ -455,7 +577,9 @@ void encoder_task(void*) {
     enc.s16AllocationMethod = st.alloc;
     enc.sbc_mode = SBC_MODE_STD;
     SBC_Encoder_Init(&enc);
-    enc.s16BitPool = std::min<int>(kStreamBitpool, st.max_bitpool);
+    // Start at the sink's negotiated floor. If the first large SBC packet is
+    // lost, it remains the ARQ FIFO head and smaller frames cannot pass it.
+    enc.s16BitPool = std::max<int>(st.min_bitpool, std::min<int>(kMinBitpool, st.max_bitpool));
     stream_bitpool = enc.s16BitPool;
     const int spf = st.blocks * st.subbands;  // samples per channel per frame (128)
     uint8_t frames[4][64];
@@ -464,8 +588,13 @@ void encoder_task(void*) {
     uint64_t made = 0;
     double phase = 0;
     while (s && s->state == State::Streaming && !s->stop) {
+        if (const int gap = gap_ms.exchange(0)) {
+            vTaskDelay(pdMS_TO_TICKS(gap));
+            if (gap_drop) made += static_cast<uint64_t>(static_cast<int64_t>(gap) * st.freq / spf / 1000);
+            std::printf("A2DP test gap %d ms done (%s)\n", gap, gap_drop ? "audio dropped" : "catching up in a burst");
+        }
         // real-time pacing with ~40 ms lead into the C6 ring (128 frames there)
-        const int64_t due = (esp_timer_get_time() - t0) * st.freq / spf / 1000000 + 14;
+        const int64_t due = (esp_timer_get_time() - t0) * st.freq / spf * (1000000 + pace_ppm.load()) / 1000000 / 1000000 + 14;
         if (static_cast<int64_t>(made) >= due) { vTaskDelay(pdMS_TO_TICKS(4)); continue; }
         // adaptive bitpool: change only between batches (one frame length per push)
         enc.s16BitPool = static_cast<SINT16>(std::max<int>(std::max<int>(st.min_bitpool, 2),
@@ -508,8 +637,29 @@ void encoder_task(void*) {
             radio_lab::push_sbc(blob, static_cast<uint8_t>(nf), flen);
         }
     }
-    enc_task = nullptr;
-    vTaskDelete(nullptr);
+}
+
+// The encoder task lives for good and sleeps between runs, with its stack in PSRAM: creating a 6 kB internal stack
+// at the moment a stream restarts took the DMA-capable memory the SD card needs to open the next track.
+constexpr uint32_t kEncStackBytes = 8192;
+TaskHandle_t enc_thread = nullptr;
+void encoder_task(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s) encoder_run();
+        enc_task = nullptr;  // "encoder idle" for the code that waits on it
+    }
+}
+void encoder_start() {
+    static StaticTask_t tcb;
+    if (!enc_thread) {
+        auto* stack = static_cast<StackType_t*>(heap_caps_malloc(kEncStackBytes, MALLOC_CAP_SPIRAM));
+        if (!stack) return;
+        enc_thread = xTaskCreateStaticPinnedToCore(encoder_task, "a2dp_sbc", kEncStackBytes, nullptr, 7, stack, &tcb, 1);
+        if (!enc_thread) { heap_caps_free(stack); return; }
+    }
+    enc_task = enc_thread;
+    xTaskNotifyGive(enc_thread);
 }
 
 // ---- inquiry: find discoverable headphones (they are discoverable in pairing mode) --------------------------------
@@ -637,7 +787,7 @@ int conn_ls44 = 700;     // connection RX window, raw ls44 (console: a2dp connls
                          // enough to arm the next TX (1028 cost a second slot per missed reply); ~4 % more misses
 int late_skip_us = 500;  // late-hook central slot skip threshold (console: a2dp lateskip <us>, 0 = off)
 
-int tx_dbm = 0;  // console: a2dp txpwr <3..20> (0 = C6 default, +9 dBm)
+int tx_dbm = 12;  // A2DP H630 stability default; console: a2dp txpwr <3..20> (0 = C6 default, +9 dBm)
 // Modulation index. The C6 sends BLE GFSK (h ~0.5); BR receivers expect 0.28-0.35 and some (the Sennheiser HDB 630)
 // lose ~1.5 % of payload bits at 0.5. Two BT baseband TX registers scale the deviation cleanly (HackRF run-length
 // profile stays GFSK-shaped, carrier unchanged): 0x600A200C bits 8..11, a signed trim (-8..+7, bt_bb_v2_tx_set writes
@@ -804,6 +954,8 @@ void session_task(void*) {
     if (s->have_key) { std::memcpy(cfg.link_key, s->key, 16); cfg.have_key = 1; }
     cfg.pair = s->pair || !s->have_key;
     cfg.max_bitpool = kMaxBitpool;
+    cfg.prefer_48k = rate48_mode < 0 ? rate_want48(saved_rate(s->peer), prefers_48k(s->peer)) : rate48_mode != 0;
+    s->asked48 = cfg.prefer_48k;
     cfg.name = "Tab5";
     const br_a2dp_io_t io = {nullptr, io_send, io_set_enc, io_random, io_now, io_event};
     br_a2dp_init(&s->eng, &cfg, &io);
@@ -817,14 +969,39 @@ void session_task(void*) {
     int64_t q_from = 0;     // link-quality window: start time, then counters at its start
     uint32_t q_tx0 = 0, q_nr0 = 0;
     bool q_done = false, q_retry = false;
-    int64_t bp_at = 0;     // adaptive bitpool: 1 s windows
-    uint32_t bp_tx = 0, bp_nr = 0, bp_drops = 0;
+    int64_t bp_at = 0;     // adaptive bitpool: 500 ms windows
+    uint32_t bp_fifo_tx = 0, bp_retx = 0, bp_drops = 0;
     int bp_clean = 0;
     AudioProgress audio_progress;
     bool audio_stalled = false;
+    int64_t suspend_wait_at = 0;  // our AVDTP SUSPEND is out and unanswered (us)
+    int suspend_tries = 0;
+    bool rate_switch = false;              // a stall taught a new sample rate: end the link and reconnect
+    int64_t clean_us = 0, clean_tick = 0;  // streaming time since the last stall (rate learning)
+    bool clean_done = false;
+    stall_history_next = stall_history_count = 0;
+    stall_history_at = 0;
     while (ok && !s->stop) {
         const Connq q = connq();
         if (!q.ok) { audio_progress.reset(); vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        const int64_t sample_now = esp_timer_get_time();
+        if (s->state == State::Streaming && clean_tick) clean_us += sample_now - clean_tick;
+        clean_tick = sample_now;
+        if (!clean_done && clean_us >= kRateCleanUs && rate48_mode < 0 && !s->beep) {
+            clean_done = true;
+            const uint8_t b = saved_rate(s->peer);
+            if (rate_stalls(b)) {
+                saved_set_rate(s->peer, rate_on_clean(b));
+                std::printf("A2DP %lu Hz clean for %lld min: earlier stalls forgiven\n",
+                            static_cast<unsigned long>(s->stream.freq), static_cast<long long>(kRateCleanUs / 60000000));
+            }
+        }
+        if (s->state == State::Streaming && sample_now >= stall_history_at) {
+            stall_history[stall_history_next] = {sample_now, q};
+            stall_history_next = (stall_history_next + 1u) % kStallHistorySamples;
+            if (stall_history_count < kStallHistorySamples) ++stall_history_count;
+            stall_history_at = sample_now + 100000;
+        }
         if (!s->connected) {
             if (q.state == 4) {
                 s->connected = true;
@@ -845,13 +1022,171 @@ void session_task(void*) {
             s->connected = false;
             break;
         }
+        if (s->media_paused && s->resume_requested.exchange(false)) {
+            bool resumed = false;
+            if (q.have_flow) {
+                char reset[40], stream[64];
+                std::snprintf(reset, sizeof reset, "lab page fiforeset 1 %u", q.next_seqn);
+                std::snprintf(stream, sizeof stream, "lab page stream 2 %04X %d 0", s->stream.media_cid,
+                              kFramesPerPacket);
+                if (lab(reset) == 0 && lab(stream) == 0) {
+                    s->media_paused = false;
+                    audio_recovering = false;
+                    audio_progress.reset();
+                    last_pcm_us = esp_timer_get_time();
+                    s->state = State::Streaming;
+                    set_status("streaming resumed");
+                    std::printf("A2DP media resumed; Bluetooth link retained\n");
+                    if (s->remote_play_pending.exchange(false)) source::play();
+                    resumed = true;
+                }
+            }
+            if (!resumed) std::printf("A2DP media resume deferred; headset link is still active\n");
+        }
+        if (s->suspended && !s->media_paused && s->resume_requested.exchange(false)) {
+            if (br_a2dp_start(&s->eng)) std::printf("A2DP starting the suspended stream\n");
+            else std::printf("A2DP start deferred: no suspended stream\n");
+        }
+        {
+            const bool asked = s->suspend_requested.exchange(false);
+            const bool idle = !s->beep && !tone_hz && esp_timer_get_time() - last_pcm_us.load() > kIdleSuspendUs;
+            if (s->state == State::Streaming && (asked || idle)) {
+                // Stop the producers first, then tell the headset: no media may follow an AVDTP SUSPEND.
+                lab("lab page stream 0 0 1 0");
+                s->state = State::Connected;
+                while (enc_task) vTaskDelay(pdMS_TO_TICKS(10));
+                s->suspend_local = true;
+                std::printf("A2DP suspending the stream (%s)\n", asked ? "headphones paused" : "nothing playing");
+                if (!br_a2dp_suspend(&s->eng)) {
+                    s->suspend_local = false;
+                    s->suspended = true;
+                    set_status("connected; idle (stream suspended)");
+                } else {
+                    suspend_wait_at = esp_timer_get_time() + 2000000;
+                    suspend_tries = 0;
+                }
+            }
+            // A headset that has stopped taking data (taken off, paused) leaves our SUSPEND stuck behind queued
+            // media. Drop the queue and offer the SUSPEND again every 2 s; if it stays shut, end the link cleanly
+            // (which also releases the headset) and let auto-reconnect bring up an idle link.
+            if (s->suspended || s->state == State::Streaming) suspend_wait_at = 0;
+            if (suspend_wait_at && esp_timer_get_time() >= suspend_wait_at) {
+                if (++suspend_tries > 5) {
+                    set_status("headphones stopped accepting data");
+                    std::printf("A2DP headphones refused data for %d s: ending the link\n", 2 * suspend_tries);
+                    audio_stalled = true;
+                    break;
+                }
+                const Connq f = connq();
+                if (f.ok && f.state == 4 && f.have_flow) {
+                    char line[40];
+                    std::snprintf(line, sizeof line, "lab page fiforeset 1 %u", f.next_seqn);
+                    if (lab(line) == 0 && lab("lab page fifo 0 3 1 -") == 0) {
+                        s->suspend_local = true;
+                        br_a2dp_suspend(&s->eng);
+                        std::printf("A2DP suspend not confirmed: queue flushed, SUSPEND sent again (%d)\n", suspend_tries);
+                    }
+                }
+                suspend_wait_at = esp_timer_get_time() + 2000000;
+            }
+        }
         if (s->state == State::Streaming && q.have_acked) {
             if (audio_progress.stalled(esp_timer_get_time(), q.acked, q.head != q.tail)) {
                 audio_stalled = true;
+                audio_recovering = auto_on && !user_stop;
                 set_status("audio stalled (no packet ACK for 2 s)");
-                std::printf("A2DP stalled: acked %lu, queued %lu; ending unusable link\n",
+                std::printf("A2DP media stalled: acked %lu, queued %lu; retaining the Bluetooth link\n",
                             static_cast<unsigned long>(q.acked), static_cast<unsigned long>(q.tail - q.head));
-                break;
+                if (q.have_flow) {
+                    std::printf("A2DP stall snapshot: slot %lu fifo %lu..%lu tx %lu retx %lu acked %lu | "
+                                "peer nak %lu ack %lu hecfail %lu verified %lu vfail %lu dup %lu noreply %lu | "
+                                "SBC level %lu drops %lu | payload %s STOP %lu GO %lu blocked %lu seqn %u\n",
+                                static_cast<unsigned long>(q.n), static_cast<unsigned long>(q.head), static_cast<unsigned long>(q.tail),
+                                static_cast<unsigned long>(q.tx), static_cast<unsigned long>(q.retx), static_cast<unsigned long>(q.acked),
+                                static_cast<unsigned long>(q.rx_nak), static_cast<unsigned long>(q.rx_ack),
+                                static_cast<unsigned long>(q.rx_hecfail), static_cast<unsigned long>(q.rx_verified),
+                                static_cast<unsigned long>(q.rx_verify_fail), static_cast<unsigned long>(q.rx_dup),
+                                static_cast<unsigned long>(q.rx_noreply), static_cast<unsigned long>(q.sbc_level),
+                                static_cast<unsigned long>(q.sbc_drops), q.payload_go ? "GO" : "STOP",
+                                static_cast<unsigned long>(q.flow_stops), static_cast<unsigned long>(q.flow_goes),
+                                static_cast<unsigned long>(q.flow_blocked), q.next_seqn);
+                }
+                std::printf("A2DP stall history: age_ms slot head tail tx retx acked noreply hecfail rxnak rxack sbcq drops flow\n");
+                const size_t first = (stall_history_next + kStallHistorySamples - stall_history_count) % kStallHistorySamples;
+                for (size_t i = 0; i < stall_history_count; ++i) {
+                    const StallSample& sample = stall_history[(first + i) % kStallHistorySamples];
+                    const Connq& h = sample.q;
+                    std::printf("A2DP stall hist %ld %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %u\n",
+                                static_cast<long>((sample.at - sample_now) / 1000), static_cast<unsigned long>(h.n),
+                                static_cast<unsigned long>(h.head), static_cast<unsigned long>(h.tail),
+                                static_cast<unsigned long>(h.tx), static_cast<unsigned long>(h.retx),
+                                static_cast<unsigned long>(h.acked), static_cast<unsigned long>(h.noreply),
+                                static_cast<unsigned long>(h.rx_hecfail), static_cast<unsigned long>(h.rx_nak),
+                                static_cast<unsigned long>(h.rx_ack), static_cast<unsigned long>(h.sbc_level),
+                                static_cast<unsigned long>(h.sbc_drops), h.payload_go ? 1u : 0u);
+                }
+                uint8_t reply_stats[240];
+                size_t reply_stats_n = sizeof reply_stats;
+                if (lab("lab page chanq", reply_stats, &reply_stats_n) == 0 && reply_stats_n >= 234) {
+                    auto stat32 = [&](size_t o) {
+                        return static_cast<unsigned long>(reply_stats[o] | reply_stats[o + 1] << 8 |
+                                                         reply_stats[o + 2] << 16 |
+                                                         static_cast<uint32_t>(reply_stats[o + 3]) << 24);
+                    };
+                    std::printf("A2DP stall replies: %lu total, ARQN1 %lu, FLOW-stop %lu | NULL %lu DM1 %lu DH1 %lu\n",
+                                stat32(158), stat32(162), stat32(166), stat32(170), stat32(174), stat32(178));
+                } else {
+                    std::printf("A2DP stall replies: unavailable\n");
+                }
+                clean_us = 0;
+                clean_done = false;
+                // Rate learning: only stalls with music flowing count (an idle or suspended stream is not a verdict
+                // on the rate), and only when the rate in use is the automatic one.
+                if (rate48_mode < 0 && !s->beep && (tone_hz || sample_now - last_pcm_us < kIdleSuspendUs)) {
+                    const bool got48 = s->stream.freq == 48000;
+                    const uint8_t before = saved_rate(s->peer);
+                    const uint8_t after = rate_on_stall(before, s->asked48, got48, &rate_switch);
+                    saved_set_rate(s->peer, after);
+                    if (s->asked48 != got48)
+                        std::printf("A2DP rate learning: the sink does not offer %s; nothing learned\n",
+                                    s->asked48 ? "48 kHz" : "44.1 kHz");
+                    else if (!rate_switch)
+                        std::printf("A2DP rate learning: stall %d of %d at %lu Hz\n", rate_stalls(after), kRateStallLimit,
+                                    static_cast<unsigned long>(s->stream.freq));
+                    if (rate_switch) {
+                        const bool next48 = rate_want48(after, prefers_48k(s->peer));
+                        std::printf("A2DP rate learning: %d stalls at %lu Hz; now %s -> reconnecting at %s\n",
+                                    kRateStallLimit, static_cast<unsigned long>(s->stream.freq), rate_choice_name(after),
+                                    next48 ? "48 kHz" : "44.1 kHz");
+                        set_status("audio stalled at %s: reconnecting at %s", got48 ? "48 kHz" : "44.1 kHz",
+                                   next48 ? "48 kHz" : "44.1 kHz");
+                        audio_recovering = !user_stop;  // the audio source resumes on the new stream
+                        break;
+                    }
+                }
+                // Stop the SBC producer first, then discard the unacknowledged media. Keep the baseband
+                // connection and AVCTP channel alive so head-detection pauses do not force a full reconnect.
+                lab("lab page stream 0 0 1 0");
+                s->media_paused = true;
+                s->state = State::Connected;
+                audio_recovering = false;
+                audio_progress.reset();
+                while (enc_task) vTaskDelay(pdMS_TO_TICKS(10));
+                bool flushed = false;
+                if (q.have_flow && q.state == 4) {
+                    char line[40];
+                    std::snprintf(line, sizeof line, "lab page fiforeset 1 %u", q.next_seqn);
+                    if (lab(line) == 0 && lab("lab page fifo 0 3 1 -") == 0) {
+                        for (int i = 0; i < 20; ++i) {
+                            const Connq f = connq();
+                            if (!f.ok || f.state != 4) break;
+                            if (f.head == f.tail) { flushed = true; break; }
+                            vTaskDelay(pdMS_TO_TICKS(20));
+                        }
+                    }
+                }
+                std::printf("A2DP media paused; Bluetooth link retained, stale FIFO %s\n", flushed ? "flushed" : "pending");
+                set_status("connected; audio paused (headset stopped ACKing media)");
             }
         } else audio_progress.reset();
         while (s->log_seen < q.count) {
@@ -881,29 +1216,40 @@ void session_task(void*) {
         }
         if (s->state == State::Streaming && !s->beep) {
             const int64_t now = esp_timer_get_time();
-            if (!bp_at) { bp_at = now + 1000000; bp_tx = q.tx; bp_nr = q.noreply; bp_drops = q.sbc_drops; }
-            else if (now >= bp_at && q.tx > bp_tx) {
-                const uint32_t pct = 100 * (q.noreply - bp_nr) / (q.tx - bp_tx);
+            if (!bp_at) { bp_at = now + 500000; bp_fifo_tx = q.fifo_tx; bp_retx = q.retx; bp_drops = q.sbc_drops; }
+            else if (now >= bp_at && (q.fifo_tx < bp_fifo_tx || q.retx < bp_retx || q.sbc_drops < bp_drops)) {
+                // fifo_reset() clears the C6 FIFO/reply counters when media resumes. Do not subtract
+                // a pre-reset baseline from the new counters: unsigned underflow corrupts adaptation.
+                bp_at = now + 500000;
+                bp_fifo_tx = q.fifo_tx;
+                bp_retx = q.retx;
+                bp_drops = q.sbc_drops;
+                bp_clean = 0;
+            } else if (now >= bp_at && q.fifo_tx > bp_fifo_tx) {
+                // A valid NULL reply can still carry ARQN=0. q.noreply only counts missing
+                // replies, so it misses the packet failures that fill this FIFO. Use ACL retries
+                // over ACL transmit attempts to adapt the SBC rate to payload ACK success.
+                const uint32_t pct = 100 * (q.retx - bp_retx) / (q.fifo_tx - bp_fifo_tx);
                 const bool dropped = q.sbc_drops != bp_drops;
                 const int bp = stream_bitpool.load();
                 if ((pct > 15 || dropped) && bp > kMinBitpool) {
-                    stream_bitpool = std::max(kMinBitpool, bp - 2);
+                    stream_bitpool = std::max(kMinBitpool, bp - 4);
                     bp_clean = 0;
-                    std::printf("A2DP bitpool %d (link %lu %% missed%s)\n", stream_bitpool.load(), static_cast<unsigned long>(pct),
+                    std::printf("A2DP bitpool %d (media retry %lu%%%s)\n", stream_bitpool.load(), static_cast<unsigned long>(pct),
                                 dropped ? ", frames dropped" : "");
-                } else if (pct < 8 && !dropped && bp < kStreamBitpool && ++bp_clean >= 5) {
+                } else if (pct < 8 && !dropped && bp < kStreamBitpool && ++bp_clean >= 10) {
                     stream_bitpool = std::min<int>(kStreamBitpool, bp + 2);
                     bp_clean = 0;
-                    std::printf("A2DP bitpool %d (link %lu %% missed)\n", stream_bitpool.load(), static_cast<unsigned long>(pct));
+                    std::printf("A2DP bitpool %d (media retry %lu%%)\n", stream_bitpool.load(), static_cast<unsigned long>(pct));
                 } else if (pct >= 8 || dropped) {
                     bp_clean = 0;
                 }
-                bp_at = now + 1000000; bp_tx = q.tx; bp_nr = q.noreply; bp_drops = q.sbc_drops;
+                bp_at = now + 500000; bp_fifo_tx = q.fifo_tx; bp_retx = q.retx; bp_drops = q.sbc_drops;
             }
         }
         br_a2dp_poll(&s->eng);
         if (s->state == State::Streaming && !s->beep && !enc_task)
-            xTaskCreatePinnedToCore(encoder_task, "a2dp_sbc", 6144, nullptr, 7, &enc_task, 1);
+            encoder_start();
         vTaskDelay(pdMS_TO_TICKS(s->state == State::Streaming ? 50 : 15));
     }
     const bool was_connected = s->connected;
@@ -914,7 +1260,9 @@ void session_task(void*) {
         if (audio_stalled) {
             const Connq q = connq();
             if (q.ok && q.state == 4 && q.have_flow && q.payload_go) {
-                // Flush the unacknowledged media fragment with an empty continuation at its SEQN.
+                // Drop stale media before DETACH: otherwise it sits behind the
+                // very packet the peer will not ACK. Core Vol 2 Part B 7.6.2.2:
+                // flush with an empty continuation at the unacknowledged SEQN.
                 char line[40];
                 std::snprintf(line, sizeof line, "lab page fiforeset 1 %u", q.next_seqn);
                 if (lab(line) == 0 && lab("lab page fifo 0 3 1 -") == 0) {
@@ -951,6 +1299,7 @@ void session_task(void*) {
         quality_at = esp_timer_get_time() + 12 * 1000000LL;  // reuses the quality retry path (same headphones)
         set_status("headphones still hold the last link: retrying in 12 s");
     }
+    if (rate_switch && !user_stop) rate_switch_at = esp_timer_get_time() + 1000000LL;
     if (auto_on && !user_stop && lost && was_connected) {  // unexpected loss of a working link: try again
         if (reconnect_left <= 0) reconnect_left = 3;
         reconnect_at = esp_timer_get_time() + (audio_stalled ? 1 : 5) * 1000000LL;
@@ -1006,6 +1355,13 @@ bool start(Kind kind, const uint8_t* addr, bool beep = false) {
     s->beep = beep;
     s->stop = false;
     s->connected = false;
+    s->media_paused = false;
+    s->resume_requested = false;
+    s->remote_play_pending = false;
+    s->suspended = false;
+    s->sink_paused = false;
+    s->suspend_requested = false;
+    s->suspend_local = false;
     s->detach_reason = 0;
     s->log_seen = 0;
     s->enc_mode = 0;
@@ -1024,6 +1380,13 @@ bool start(Kind kind, const uint8_t* addr, bool beep = false) {
 void supervisor_task(void*) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!task && !user_stop && rate_switch_at && esp_timer_get_time() >= rate_switch_at) {
+            rate_switch_at = 0;
+            std::printf("A2DP reconnecting at the learned sample rate\n");
+            quality_start = true;  // keep the retry budgets of the session that stalled
+            if (!start(Kind::Connect, s->peer_valid ? s->peer : nullptr)) { quality_start = false; audio_recovering = false; }
+            continue;
+        }
         if (!task && !user_stop && quality_at && esp_timer_get_time() >= quality_at) {
             quality_at = 0;
             std::printf("A2DP reconnecting for link quality (%d tries left)\n", quality_left.load());
@@ -1072,6 +1435,7 @@ Status status() {
     if (!s || !saved_mu) return st;
     st.running = task != nullptr;
     st.streaming = s->state == State::Streaming;
+    st.connected = st.running && s->connected;
     st.searching = st.running && s->searching;
     st.auto_reconnect = auto_on;
     st.tone_hz = tone_hz;
@@ -1155,9 +1519,11 @@ void forget_saved(const char* addr) {
 }
 
 void disconnect() {
+    audio_recovering = false;
     user_stop = true;
     reconnect_left = 0;
     quality_at = 0;
+    rate_switch_at = 0;
     if (task && s) s->stop = true;
 }
 
@@ -1179,7 +1545,20 @@ void init() {
     xTaskCreate(supervisor_task, "a2dp_sup", 3072, nullptr, 2, nullptr);
 }
 
-bool ready() { return s && s->state == State::Streaming && !s->beep && !tone_hz; }
+bool ready() {
+    // An idle-suspended stream still takes audio (write_pcm starts it again); one the headset paused does not.
+    return s && !s->beep && !tone_hz &&
+           (s->state == State::Streaming || (s->suspended && !s->sink_paused && !s->media_paused && s->connected));
+}
+void request_resume() {
+    if (!s || !(s->media_paused || s->suspended)) return;
+    s->sink_paused = false;  // an explicit local Play overrides the headset's pause
+    s->resume_requested = true;
+    if (xTaskGetCurrentTaskHandle() == task) return;
+    const int64_t until = esp_timer_get_time() + 1000000;
+    while ((s->media_paused || s->suspended) && task && esp_timer_get_time() < until) vTaskDelay(pdMS_TO_TICKS(5));
+}
+bool recovering_audio() { return audio_recovering; }
 int rate() { return ready() ? static_cast<int>(s->stream.freq) : 0; }
 
 size_t write_pcm(const int16_t* stereo, size_t frames, int timeout_ms) {
@@ -1187,7 +1566,20 @@ size_t write_pcm(const int16_t* stereo, size_t frames, int timeout_ms) {
     size_t done = 0;
     const int64_t until = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
     const uint32_t max_level = s->stream.freq * 120 / 1000;
+    last_pcm_us = esp_timer_get_time();
     while (done < frames && ready()) {
+        if (s->suspended) {  // idle-suspended: audio is back, start the stream and wait for it
+            s->resume_requested = true;
+            if (esp_timer_get_time() > until) break;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (s->media_paused) {
+            if (esp_timer_get_time() > until) break;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (s->state != State::Streaming) break;
         if (ring_level() >= max_level || ring_level() >= kRingFrames - 1) {
             if (esp_timer_get_time() > until) break;
             xSemaphoreTake(ring_space, pdMS_TO_TICKS(10));
@@ -1451,6 +1843,69 @@ void command(const char* line) {
     if (!std::strcmp(c, "tone") && n == 3) {
         tone_hz = !std::strcmp(tok[2], "off") ? 0 : std::atoi(tok[2]);
         std::printf("A2DP test tone %d Hz\n", tone_hz);
+        if (tone_hz) request_resume();  // an idle-suspended stream starts again for the tone
+        return;
+    }
+    if (!std::strcmp(c, "pace") && n == 3) {  // test: send media faster (+) or slower (-) than real time
+        pace_ppm = std::max(-100000, std::min(100000, std::atoi(tok[2])));
+        std::printf("A2DP media pace %+d ppm (next stream start)\n", pace_ppm.load());
+        return;
+    }
+    if (!std::strcmp(c, "minbp") && n == 3) {  // test: floor/start of the adaptive bitpool (2..kStreamBitpool)
+        kMinBitpool = std::max(2, std::min<int>(kStreamBitpool, std::atoi(tok[2])));
+        std::printf("A2DP bitpool floor %d (next stream start)\n", kMinBitpool);
+        return;
+    }
+    if (!std::strcmp(c, "fpp") && n == 3) {  // test: SBC frames per RTP packet (1..15)
+        kFramesPerPacket = std::max(1, std::min(15, std::atoi(tok[2])));
+        std::printf("A2DP %d SBC frames per packet (next stream start)\n", kFramesPerPacket);
+        return;
+    }
+    if (!std::strcmp(c, "gap") && n >= 3) {  // test: one delivery gap of <ms>; "drop" = no catch-up burst afterwards
+        gap_drop = n >= 4 && !std::strcmp(tok[3], "drop");
+        gap_ms = std::max(0, std::min(3000, std::atoi(tok[2])));
+        return;
+    }
+    if (!std::strcmp(c, "maxbp") && n == 3) {  // test: max bitpool we advertise and configure (the encoder stays <= 14)
+        kMaxBitpool = static_cast<uint8_t>(std::max(14, std::min(53, std::atoi(tok[2]))));
+        std::printf("A2DP configured max bitpool %u (next connect)\n", kMaxBitpool);
+        return;
+    }
+    if (!std::strcmp(c, "rate48") && n == 3) {  // test: configure 48 kHz when the sink offers it
+        rate48_mode = !std::strcmp(tok[2], "auto") ? -1 : std::atoi(tok[2]) != 0;
+        std::printf("A2DP sample rate: %s (next connect)\n",
+                    rate48_mode < 0 ? "automatic (learned per device)" : rate48_mode ? "48 kHz" : "44.1 kHz");
+        return;
+    }
+    if (!std::strcmp(c, "rates")) {  // learned sample rates of the saved devices; "a2dp rates clear" forgets them
+        const bool clear = n == 3 && !std::strcmp(tok[2], "clear");
+        SavedLock l;
+        for (int i = 0; i < saved_n; ++i) {
+            Saved& d = saved_list[i];
+            if (clear) d.rate = 0;
+            std::printf("A2DP %d %02X:%02X:%02X:%02X:%02X:%02X %s: %s, %d stall(s) counted -> asks %s\n", i, d.addr[5],
+                        d.addr[4], d.addr[3], d.addr[2], d.addr[1], d.addr[0], d.name, rate_choice_name(d.rate),
+                        rate_stalls(d.rate), rate_want48(d.rate, prefers_48k(d.addr)) ? "48 kHz" : "44.1 kHz");
+        }
+        if (clear) saved_store();
+        return;
+    }
+    if (!std::strcmp(c, "mem")) {  // internal RAM (the SD card's DMA buffers and task stacks come from it)
+        std::printf("A2DP mem: internal free %u largest %u low %u | DMA free %u largest %u | PSRAM free %u\n",
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+        return;
+    }
+    if (!std::strcmp(c, "suspend") && n == 2) {  // test: AVDTP SUSPEND as if the headset's pause key arrived
+        if (s) { s->sink_paused = true; s->suspend_requested = true; }
+        return;
+    }
+    if (!std::strcmp(c, "resume") && n == 2) {   // test: start a suspended stream again
+        if (s && (s->suspended || s->media_paused)) { s->sink_paused = false; s->resume_requested = true; }
         return;
     }
     if (!std::strcmp(c, "verbose") && n == 3) {
