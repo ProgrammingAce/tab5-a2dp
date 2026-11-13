@@ -1,18 +1,15 @@
 # Native Bluetooth Classic A2DP on M5Stack Tab5
 
-A minimal touchscreen proof of concept that streams audio from the Tab5 to
+A minimal proof of concept that streams audio from the Tab5 to
 ordinary Bluetooth Classic headphones or speakers using only its ESP32-P4 and
 ESP32-C6. The P4 creates a tone and encodes it as SBC; custom C6 firmware
-transmits the Classic radio packets. No external Bluetooth adapter or computer
-audio relay is needed to run the demo. A2DP (Advanced Audio Distribution
-Profile) is the audio profile used here.
+transmits the Classic it as bluetooth classic over A2DP. 
 
 ## How Bluetooth Classic is achieved
 
 The P4 has no Bluetooth radio, and the C6's normal Bluetooth controller is BLE
 only. This project implements an experimental Classic BR link by repurposing the
-C6 radio through custom firmware; it does not enable a stock Classic controller
-or use ESP-IDF's normal Bluedroid A2DP API.
+C6 radio through custom firmware.
 
 The work is split between the processors:
 
@@ -37,33 +34,6 @@ Subsequent connections authenticate with that key and establish E0 encryption.
 The host opens or accepts the L2CAP AVDTP signaling channel, negotiates SBC
 capabilities, then opens and starts the media stream.
 
-Three details make this work with ordinary headphones, not just one test speaker:
-
-- **Paging any address.** The C6 sends each Classic packet as a BLE DTM frame. The
-  page response (FHS) originally carried the peer's sync word in the BLE header,
-  so the frame length was whatever the peer's address dictated; only about one
-  address in six could be paged. Since C6 1.4.253 the whole BR packet follows a
-  BLE header the firmware chooses (`page shift`), so every address works.
-- **Classic modulation index.** BLE transmits with a modulation index of about
-  0.5; Bluetooth Classic specifies 0.28-0.35, and some receivers (a Sennheiser
-  HDB 630 here) lose about 1.5 % of payload bits at 0.5 and reject almost every
-  audio packet. During a Classic session the P4 sets two C6 baseband TX
-  registers: `0x600A200C` bits 8-11 (a signed deviation trim, -8) and
-  `0x600A20EC` bits 24-31 (TX filter gain, 0x40 instead of 0xEC). That gives a
-  clean GFSK waveform at h = 0.33 (measured with a HackRF) with the carrier
-  unchanged; the BLE values are restored when the session ends. `a2dp brmod 0`
-  turns it off for comparison.
-- **Spec behaviour sinks rely on.** The host serves an SDP record for the A2DP
-  Source (some sinks refuse to open AVDTP without it), tries every audio sink
-  endpoint until one offers SBC (sinks often list AAC or vendor codecs first),
-  accepts a sink's smaller encryption key size (7-16 bytes), answers
-  GET_CONFIGURATION, and honours a sink's SUSPEND (the stream stays paused until
-  the sink or the user starts it again).
-- **The sample rate each device handles.** A2DP requires every SBC sink to accept
-  44.1 and 48 kHz, but some handle one of them badly: the HDB 630 stops accepting
-  audio after seconds to minutes at 44.1 kHz and runs clean at 48 kHz. The host
-  learns the rate per saved device (see [Sample rate](#sample-rate)).
-
 ## How A2DP audio is achieved
 
 ```mermaid
@@ -87,11 +57,7 @@ Each saved device has a learned rate, stored with its bond in NVS. A device
 starts from a first guess: 48 kHz for Sennheiser addresses (OUI `80:C3:BA`),
 44.1 kHz for everything else. Two media stalls at one rate while audio is
 playing switch the device to the other rate; the host ends the link and
-reconnects at the new rate at once, and the tone carries on. If the other rate
-stalls just as often, the rate is not the cause: the device goes back to its
-first guess and learning stops for it. Ten minutes of streaming without a stall
-clears earlier stalls (a headset taken off, a radio fade). A stall only counts
-when the rate in use is the one the host asked for.
+reconnects at the new rate at once, and the tone carries on. 
 
 `a2dp rates` lists each saved device's learned rate and stall count; `a2dp rates
 clear` resets them. `a2dp rate48 0` or `1` fixes the rate at 44.1 or 48 kHz for
@@ -113,11 +79,6 @@ internal tone off before feeding external PCM.
 - C6 running the custom **1.4.266** image in `firmware/network_adapter.bin`,
   installed and confirmed before launching the P4 demo. Stock Tab5 C6 firmware
   cannot run this implementation. See [C6 firmware](firmware/README.md).
-
-The project configuration supplies the Tab5 wiring: SDIO slot 1, four-bit bus at
-40 MHz, CMD 13, CLK 12, D0 11, D1 10, D2 9, D3 8, active-low C6 reset on GPIO
-15. The BSP powers the C6 rail through the board's I/O expander. PSRAM and a 1
-kHz FreeRTOS tick are enabled.
 
 ## Flash the prebuilt firmware
 
@@ -179,11 +140,6 @@ supplied partition layout preserves that data unless flash is erased.
   search or connection attempt.
 - **Play 440 Hz tone / Stop tone** controls audio once streaming is established.
 
-Controls are disabled when their action is unavailable. Radio operations run
-outside the LVGL task, so the display and touch remain responsive during paging
-and discovery. The screen appears before the radio starts and reports transport
-startup errors.
-
 ## Demonstrate the feature from USB
 
 Turn the headphones down and place your chosen device in pairing mode:
@@ -217,40 +173,6 @@ a2dp tone off
 a2dp stop
 ```
 
-On later runs, `a2dp connect` connects the default saved device and
-`a2dp connect <n>` a specific one from `a2dp list`; `a2dp forget <n>` removes one.
-`a2dp auto 1` enables bounded reconnect to the default device, including after
-boot; `a2dp auto 0` disables it. Always stop the link and wait for detach before
-resetting or reflashing: silent link loss can make a receiver temporarily refuse
-another connection (the host retries a "connection already exists" refusal after
-12 seconds).
-
-Missed-reply quality reconnects are disabled by default (`a2dp qmax 100`).
-The old 12 % threshold could deliberately disconnect otherwise usable H630 links.
-Automatic reconnect after actual link loss and adaptive SBC bitpool remain enabled.
-For lab experiments, `a2dp qmax <pct>` below 100 enables the two-second startup
-quality check with up to three reconnects; -1 forces retries. `a2dp lateskip`,
-`a2dp connls44` and `a2dp rxearly` apply to the next connection.
-
-The headphones' play and pause keys work (AVRCP pass-through). Pause or stop
-pauses the tone and suspends the stream; play starts both again. A SUSPEND sent
-by the headphones themselves (their pause key or wear sensor) pauses the tone as
-well. `a2dp suspend` and `a2dp resume` do the same from the console.
-
-A link can also drift into a bad phase minutes after it started, so the stream
-adapts continuously: every 500 ms, more than 15 % media retransmissions or
-dropped SBC frames lower the SBC bitpool by four, down to 8; five clean seconds
-under 8 % raise it by two, up to 14. Audio quality drops during a bad phase
-instead of breaking up.
-The connection receive window (`ls44` 700) ends early enough that a missed
-reply costs one radio slot instead of two.
-
-Diagnostics: `a2dp diag` prints the link counters (missed replies, retransmits,
-acknowledgements and the sink's reply headers), `a2dp chans` the missed replies
-per RF channel (interference shows up as a block of bad channels). The
-convenience command `a2dp pair` with no argument discovers and pairs the first
-audio device it finds. `a2dp connect beep` loops the C6's built-in SBC beep for
-diagnostics; the P4 tone demonstrates the full PCM and encoder path.
 
 ## Source layout
 
@@ -275,51 +197,6 @@ guard; Classic mode takes exclusive ownership of the radio.
 
 ## Current limits and validation
 
-**2026-11-13, sync with the parent firmware.** Brings over the host changes
-made since 2026-11-12: source-initiated SUSPEND/START with an idle suspend after
-three seconds without audio, the headphones' play and pause keys, a media stall
-that keeps the link up (the stream resumes on the play key) instead of
-reconnecting, and per-device sample-rate learning ([Sample rate](#sample-rate)).
-The host now also advertises a 1792-byte flow-control lag (`kFeatures0`)
-instead of claiming an instant payload STOP. In the parent firmware the HDB 630
-at 48 kHz ran three 30-minute runs without a stall (off-head), where 44.1 kHz
-stalled in five of six shorter runs; that was the cause of the stalls described
-below. The rate-learning switch has not yet been exercised on hardware, and this
-standalone P4 image has not been flashed. C6 image unchanged (1.4.266).
-
-**2026-11-12, HDB 630 stall recovery backport.** The host now watches for two
-seconds without an acknowledged ACL media fragment while its transmit queue is
-non-empty. It flushes the stale fragment before detaching, then retries an
-unexpected audio stall after one second instead of five. This shortens recovery
-from the observed media-ACK lockup; it does not prevent the lockup. On the
-development Tab5, an eight-minute comparison still stalled at about 7m18s, then
-reconnected automatically. The separate experimental flow-control lag
-advertisement was not included because it did not prevent that stall. (Resolved
-2026-11-13: the stall depends on the sample rate; see above.) Run `sh tools/test_a2dp_progress.sh`
-for the watchdog timing checks.
-
-**2026-11-11, C6 1.4.265-1.4.266 update.** The P4 now serializes console
-and native radio commands so a diagnostic reply cannot be mistaken for a lost
-connection. The C6 preserves ACL payload flow control across LMP packets,
-allows LMP while media is stopped, preserves the last SEQN on POLL, and
-serializes media-PDU publication with command FIFO writes. Regression tests
-cover flow control and refusal of headphone remote controls during streaming.
-
-In the parent firmware, the latest short H630 run stayed connected throughout
-about 100 seconds, with 47,022 additional acknowledged fragments across the
-92-second sampling interval and no SBC drops. **Long-term H630 stability remains
-unresolved:** earlier runs stalled with repeated media NAKs despite valid SBC
-and encrypted packets. This short transport check does not establish sustained
-audible playback. The rebuilt standalone P4 image has not been flashed or
-hardware-tested; the bundled C6 1.4.266 image was installed and confirmed in the
-parent firmware. No device firmware was changed for this publication.
-
-Diagnostics now include payload-flow counters in `a2dp diag`, `a2dp sbc` for a
-single encoded frame batch, `a2dp checktx <firstslot> <count> <hex>` for local
-captured-packet CRC verification (count 1..4096), and `lab page media cap` /
-`lab page media <offset>` for a frozen outgoing media-PDU snapshot. Capture
-output may contain audio; avoid publishing private recordings.
-
 The standalone build also includes the legacy ESP-Hosted C6 target symbol needed
 by the pinned Wi-Fi Remote dependency.
 
@@ -331,60 +208,7 @@ sh c6_fw/c6_firmware/test/run_host_tests.sh
 sh c6_fw/cis_ll/test/run.sh
 ```
 
-**2026-11-11, C6 1.4.253-1.4.264 update.** Developed and measured in the parent
-Tab5 firmware (same host, baseband and C6 code as this repository) with a
-Sennheiser HDB 630, which the earlier code could neither page (its address gave
-a 217-byte FHS frame) nor stream to:
-
-- Search finds it within 5 s; paging takes 0.5-3.6 s, then SSP pairing,
-  encryption, the SDP lookup and the endpoint walk (SBC is its fourth endpoint).
-- Before the modulation change it acknowledged 3 % of audio fragments (bitpool
-  fell to 8 with dropped frames, audibly almost silent). With the Classic
-  modulation index: 92 % acknowledged, 99.9 % of its replies ACK, missed replies
-  8-9 % (was about 30 %), bitpool steady at 14 and no SBC frames dropped in a
-  60-second run.
-- Not re-tested with these changes: the Galaxy Projector Speaker and Bose
-  headphones from the earlier validation, and this demo's own P4 build on
-  hardware. The prebuilt C6 image is the one installed and confirmed on the
-  development Tab5; the P4 images are a clean build of this repository.
-
-**2026-11-10, C6 1.4.247-1.4.252 update.** The radio changes (long-FHS paging,
-late-hook slot skip, FHS-anchored slot grid), the link-quality reconnect and the
-adaptive bitpool were
-developed and measured in the parent Tab5 firmware on a Galaxy Projector Speaker
-(LAP `E91187`, length byte 70): page in 0.1-3.5 s, SSP pairing, encrypted
-streaming; ten consecutive connections at 1-8 % missed replies with no dropped
-SBC frames, and three forced quality retries that reconnected cleanly. Before the
-slot-skip fix about half of all connections ran at 25-40 % missed replies with
-audible breakup, and bad phases also began mid-link. With 1.4.252 and the
-adaptive bitpool, a 5.3-minute soak that included four minutes at about 41 %
-missed replies (bitpool 8) dropped no SBC frames; the bitpool returned to 14 in
-a clean stretch. The prebuilt images in `firmware/` are the shipped C6 image that
-was installed and confirmed on that Tab5, and a clean P4 build of this demo. This
-demo's own P4 build has not yet been flashed and run on hardware, and the Bose
-headphones used for the earlier work have not been retested with 1.4.252.
-
-**Earlier validation.**
-
-The touchscreen POC was flashed to a Tab5 with P4 revision 1.3 on 2026-11-10.
-Boot logs confirm a 1280 x 720 landscape display, ST712x touch initialization,
-and a 75% backlight. The C6 SDIO transport and USB console respond, and the
-saved bond is retained. A saved-bond connection test timed out without a
-receiver response; audible playback from this POC remains unverified. Physical
-touch interaction has not been manually verified.
-
-The P4 application built successfully with ESP-IDF 5.5.5 in a clean build
-directory, resolving board dependencies through the component registry. The
-bundled C6 source also built successfully in isolation; its controller hook
-checker reports `RESULT: PASS`, and the guard and CIS host tests pass.
-
-This is an experimental BR-only implementation using one-slot packets, a low SBC
-bitpool (8-14 for streaming, adapted to the link; advertised maximum 20), and a fixed local identity
-chosen to fit the DTM framing constraints. Multi-slot DH3/DH5, EDR, adaptive
-frequency hopping, AVRCP (remote control and absolute volume), legacy PIN pairing
-(pre-2.1 devices) and role switch are not implemented; incoming AVCTP is refused.
-Reconnect after a real range loss remains unverified. Wi-Fi and BLE are unavailable while Classic mode owns the C6 radio.
-It is a proof of concept, not a qualified Bluetooth product.
+This is a proof of concept, not a qualified Bluetooth product.
 
 ## Attribution
 
